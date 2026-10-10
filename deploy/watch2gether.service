@@ -1,0 +1,12 @@
+[Unit]
+Description=watch2gether synchronized video watching
+After=network-online.target
+
+[Service]
+# Put W2G_PASSWORD=yourpassword in this file (chmod 600)
+EnvironmentFile=%h/.config/watch2gether.env
+ExecStart=%h/.cargo/bin/watch2gether %h/Videos --port 8080
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

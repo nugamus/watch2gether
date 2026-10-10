@@ -1,0 +1,201 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>watch2gether</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0b0e;color:#ddd;font:14px system-ui,sans-serif}
+  body{display:flex;flex-direction:column}
+  #main{flex:1;min-height:0;display:flex}
+  #lib{flex:0 0 280px;width:280px;overflow-y:auto;overflow-x:hidden;border-right:1px solid #222;padding:6px;box-sizing:border-box}
+  #lib .file{padding:4px 8px;cursor:pointer;border-radius:4px;word-break:break-all}
+  #lib .file:hover{background:#1c1c24}#lib .file.cur{background:#2a2a40}
+  #lib summary{padding:4px 6px;cursor:pointer;user-select:none;color:#aab}
+  #lib .kids{margin-left:14px;border-left:1px solid #222;padding-left:4px}
+  @media(max-width:700px){#main{flex-direction:column}#lib{flex:0 0 auto;width:auto;max-height:40vh;border:0;border-bottom:1px solid #222}}
+  #stage{flex:1 1 0;min-width:0;min-height:0;position:relative;display:flex}
+  video{flex:1;min-width:0;min-height:0;width:100%;height:100%;background:#000}
+  #tap{position:absolute;inset:0;margin:auto;width:max-content;height:max-content;padding:14px 22px;font:inherit;font-size:16px;color:#fff;background:rgba(40,40,70,.92);border:1px solid #556;border-radius:8px;cursor:pointer}
+  #tap[hidden]{display:none}
+  #prep{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:rgba(11,11,14,.88);text-align:center;padding:16px}
+  #prep[hidden]{display:none}
+  #wait{position:absolute;top:10px;left:50%;transform:translateX(-50%);padding:6px 8px 6px 14px;border-radius:16px;background:rgba(20,20,30,.9);border:1px solid #445;font-size:13px;white-space:nowrap;display:flex;align-items:center;gap:8px}
+  #force{font:inherit;font-size:12px;color:#ddd;background:#2a2a40;border:1px solid #445;border-radius:12px;padding:3px 10px;cursor:pointer}
+  #wait[hidden]{display:none}
+  #prep .bar{width:min(260px,70%);height:6px;background:#2a2a35;border-radius:3px;overflow:hidden}
+  #prep .bar i{display:block;height:100%;width:0;background:#7a7aff;transition:width .4s}
+  #bar{padding:6px 12px;display:flex;gap:16px;justify-content:space-between}
+  #toggle{background:#1c1c24;color:#ddd;border:1px solid #333;border-radius:4px;padding:3px 10px;cursor:pointer;font:inherit}
+  #toggle:hover{background:#2a2a40}
+  #main.hide #lib{display:none}
+  #status.ok{color:#6c6}#status.bad{color:#e66}
+</style></head>
+<body>
+<div id="main"><div id="lib"></div><div id="stage"><video id="v" controls playsinline preload="auto"></video><button id="tap" type="button" hidden>▶ Tap to join playback</button><div id="wait" hidden><span id="waitText"></span> <button id="force" type="button">Resume anyway</button></div><div id="prep" hidden><div id="prepText"></div><div class="bar"><i id="prepBar"></i></div><small>Converting for browser playback (first time only)</small></div></div></div>
+<div id="bar"><span id="status" class="bad">connecting…</span><button id="toggle" type="button">☰ Library</button><span id="viewers"></span></div>
+<script>
+const v = document.getElementById('v');
+const tap = document.getElementById('tap');
+const status = document.getElementById('status');
+let localSeekAt = -1e9, remoteSeekT = null, lastSeq = -1;
+let ws, last = {playing:false, t:0, at:performance.now()}, curFile = null, curSrc = null;
+const prep = document.getElementById('prep');
+const waitText = document.getElementById('waitText');
+const base = f => f.split('/').pop();
+function flash(msg) {
+  status.textContent = msg; status.className = 'bad';
+  setTimeout(() => { if (ws && ws.readyState === 1) { status.textContent = 'connected'; status.className = 'ok'; } }, 10000);
+}
+const lib = document.getElementById('lib');
+const url = f => '/video/' + f.split(/[\\/]/).map(encodeURIComponent).join('/');
+const main = document.getElementById('main');
+const mobile = matchMedia('(max-width:700px)');
+function setHidden(h) {
+  main.classList.toggle('hide', h);
+  document.getElementById('toggle').setAttribute('aria-pressed', String(!h));
+  try { localStorage.setItem('w2g-hide', h ? '1' : '0'); } catch {}
+}
+document.getElementById('toggle').onclick = () => setHidden(!main.classList.contains('hide'));
+try { setHidden(localStorage.getItem('w2g-hide') === '1'); } catch { setHidden(false); }
+
+let files = [];
+async function loadLib() {
+  files = await (await fetch('/api/files')).json();
+  renderLib();
+}
+function renderLib() {
+  const tree = {};
+  for (const f of files) {
+    let n = tree;
+    const parts = f.split('/');
+    for (const p of parts.slice(0, -1)) n = n[p] ??= {};
+    (n[''] ??= []).push([parts.at(-1), f]);
+  }
+  const build = (n, parent) => {
+    for (const k of Object.keys(n).filter(k => k).sort()) {
+      const d = document.createElement('details');
+      const sum = document.createElement('summary');
+      sum.textContent = k;
+      const inner = document.createElement('div');
+      inner.className = 'kids';
+      d.append(sum, inner);
+      build(n[k], inner);
+      d.open = !!inner.querySelector('.cur');
+      parent.appendChild(d);
+    }
+    for (const [name, f] of (n[''] || []).sort()) {
+      const d = document.createElement('div');
+      d.textContent = name; d.title = f; d.dataset.f = f;
+      d.className = 'file' + (f === curFile ? ' cur' : '');
+      d.onclick = () => { send({type:'select', path:f}); if (mobile.matches) setHidden(true); };
+      parent.appendChild(d);
+    }
+  };
+  lib.innerHTML = '';
+  build(tree, lib);
+  if (!files.length) lib.textContent = 'No videos found';
+}
+const expected = () => last.playing ? last.t + (performance.now()-last.at)/1000 : last.t;
+const send = o => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+
+function connect() {
+  ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws');
+  ws.onopen = () => { resetBuffering(); lastSeq = -1; status.textContent='connected'; status.className='ok'; };
+  ws.onclose = () => { status.textContent='disconnected, retrying…'; status.className='bad'; setTimeout(connect, 1000); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'viewers') document.getElementById('viewers').textContent = m.n + ' watching';
+    if (m.type === 'state') apply(m);
+    if (m.type === 'progress') { document.getElementById('prepBar').style.width = m.pct + '%'; document.getElementById('prepText').textContent = 'Preparing ' + base(m.path) + '… ' + m.pct + '%'; }
+    if (m.type === 'error') flash(m.msg);
+  };
+}
+
+function apply(m) {
+  prep.hidden = !m.preparing;
+  if (m.preparing) { document.getElementById('prepText').textContent = 'Preparing ' + base(m.preparing) + '…'; }
+  else document.getElementById('prepBar').style.width = '0';
+  const src = m.cached ? '/cache/' + m.cached + '.mp4' : (m.file ? url(m.file) : null);
+  const w = document.getElementById('wait');
+  w.hidden = !m.waiting;
+  if (m.waiting) waitText.textContent = '⏳ Waiting for ' + m.waiting + (m.waiting > 1 ? ' viewers' : ' viewer') + ' to buffer…';
+  if (src !== curSrc) { curSrc = src; resetBuffering(); if (src) v.src = src; else v.removeAttribute('src'); }
+  if (m.file !== curFile) {
+    curFile = m.file;
+    for (const d of lib.querySelectorAll('.file')) d.classList.toggle('cur', d.dataset.f === curFile);
+    for (const d of lib.querySelectorAll('details')) if (d.querySelector('.cur')) d.open = true;
+  }
+  // 'forced' = someone deliberately moved the position (seek / new video); anything else is just the room pausing for a stall.
+  const forced = m.seq !== lastSeq; lastSeq = m.seq;
+  if (forced) { clearTimeout(bufTimer); reported = true; } // the server now waits for our confirmation
+  // Don't move a viewer who is mid-seek of their own, or who is buffering and merely catching up
+  // (a forward seek into data they don't have yet would stall them even more).
+  const mid = v.seeking || performance.now() - localSeekAt < 1500 || (reported && !forced);
+  last = {playing:m.playing, t: mid ? v.currentTime : m.t, at:performance.now()};
+  if (!mid && Math.abs(v.currentTime - m.t) > 0.6) { remoteSeekT = m.t; v.currentTime = m.t; }
+  if (m.playing && v.paused) {
+    v.play().catch(e => { if (e.name === 'NotAllowedError') tap.hidden = false; });
+  }
+  if (!m.playing && !v.paused) v.pause();
+}
+
+// Events are only sent when they differ from the last known shared state,
+// so applying remote updates never echoes back.
+v.addEventListener('play',  () => { if (!last.playing) send({type:'play',  t:v.currentTime}); });
+v.addEventListener('pause', () => { if (last.playing)  send({type:'pause', t:v.currentTime}); });
+// Send on 'seeking' (not 'seeked') and remember it: on slow links a stale server update can arrive
+// mid-seek and would otherwise yank the video back (Safari's ±10s buttons hit this).
+v.addEventListener('seeking', () => {
+  if (remoteSeekT !== null && Math.abs(v.currentTime - remoteSeekT) < 0.25) { remoteSeekT = null; return; } // our own apply()
+  remoteSeekT = null;
+  localSeekAt = performance.now();
+  last = {playing:last.playing, t:v.currentTime, at:performance.now()};
+  send({type:'seek', t:v.currentTime});
+});
+// Strict sync: the room only plays while every viewer is ready, and freezes for anyone who isn't.
+//  - while the room is playing, a stall (>700ms) reports "buffering" and everyone pauses;
+//  - while the room is paused, a viewer without enough buffered video also reports "buffering",
+//    so pressing play waits for them instead of starting without them.
+// "ready" = enough seconds buffered ahead. That threshold doubles if this viewer stalls again soon
+// after (3s -> 6s -> ... -> 30s), so a slow link pauses less often but for longer.
+let bufTimer = null, reported = false, needSecs = 3, lastStall = 0;
+function aheadSecs() {
+  const b = v.buffered;
+  for (let i = 0; i < b.length; i++) if (v.currentTime >= b.start(i) - 0.1 && v.currentTime <= b.end(i)) return b.end(i) - v.currentTime;
+  return 0;
+}
+function isReady() {
+  const left = (v.duration || Infinity) - v.currentTime;
+  const need = Math.min(needSecs, Math.max(0.5, left - 0.2));
+  const ahead = aheadSecs();
+  // readyState 4 = the browser itself predicts uninterrupted playback (helps where paused videos buffer little, e.g. iOS)
+  return v.readyState >= 2 && (ahead >= need || v.readyState >= 4);
+}
+function resetBuffering() { clearTimeout(bufTimer); reported = false; }
+function reportReady() { if (!reported) return; resetBuffering(); send({type:'ready', t:v.currentTime, seq:lastSeq}); }
+function reportBuffering() {
+  if (reported) return;
+  const now = performance.now();
+  needSecs = now - lastStall < 30000 ? Math.min(needSecs * 2, 30) : 3;
+  lastStall = now;
+  reported = true;
+  send({type:'buffering'});
+}
+v.addEventListener('waiting', () => {
+  if (!last.playing || reported) return;
+  clearTimeout(bufTimer);
+  bufTimer = setTimeout(() => { if (v.readyState < 3) reportBuffering(); }, 700);
+});
+for (const e of ['playing', 'canplay']) v.addEventListener(e, () => clearTimeout(bufTimer));
+setInterval(() => {
+  if (!ws || ws.readyState !== 1) return;
+  if (!curSrc) { reportReady(); return; } // nothing to load, so nothing to wait for
+  const ok = isReady();
+  if (reported) { if (ok) reportReady(); }
+  else if (!last.playing && !ok) reportBuffering();
+}, 200);
+document.getElementById('force').onclick = () => send({type:'force'});
+loadLib(); // Mobile browsers block play() without a gesture; this button supplies one.
+tap.onclick = () => { tap.hidden = true; if (last.playing) { v.currentTime = expected(); v.play().catch(()=>{ tap.hidden = false; }); } };
+v.addEventListener('playing', () => { tap.hidden = true; });
+connect();
+</script>
+</body></html>
