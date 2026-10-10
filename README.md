@@ -25,7 +25,7 @@ No uploads, no third-party service, nothing to install for viewers: they just op
 ## Quick start
 
 ```sh
-git clone https://github.com/<you>/watch2gether.git
+git clone https://github.com/stasnocap/watch2gether.git
 cd watch2gether
 W2G_PASSWORD='choose-a-password' cargo run --release -- ~/Videos --port 8080
 ```
