@@ -7,6 +7,7 @@
   #main{flex:1;min-height:0;display:flex}
   #lib{flex:0 0 280px;width:280px;overflow-y:auto;overflow-x:hidden;border-right:1px solid #222;padding:6px;box-sizing:border-box}
   #lib .file{padding:4px 8px;cursor:pointer;border-radius:4px;word-break:break-all}
+  #lib .del{float:right;margin-left:6px;opacity:.5}#lib .del:hover{opacity:1}
   #lib .file:hover{background:#1c1c24}#lib .file.cur{background:#2a2a40}
   #lib summary{padding:4px 6px;cursor:pointer;user-select:none;color:#aab}
   #lib .kids{margin-left:14px;border-left:1px solid #222;padding-left:4px}
@@ -56,7 +57,7 @@ function setHidden(h) {
 document.getElementById('toggle').onclick = () => setHidden(!main.classList.contains('hide'));
 try { setHidden(localStorage.getItem('w2g-hide') === '1'); } catch { setHidden(false); }
 
-let files = [];
+let files = [], canDelete = false;
 async function loadLib() {
   files = await (await fetch('/api/files')).json();
   renderLib();
@@ -86,6 +87,15 @@ function renderLib() {
       d.textContent = name; d.title = f; d.dataset.f = f;
       d.className = 'file' + (f === curFile ? ' cur' : '');
       d.onclick = () => { pendingSel = f; send({type:'select', path:f}); if (mobile.matches) setHidden(true); };
+      if (canDelete) {
+        const x = document.createElement('span');
+        x.className = 'del'; x.textContent = '🗑'; x.title = 'Delete from disk';
+        x.onclick = e => {
+          e.stopPropagation();
+          if (confirm('Permanently delete ' + f + ' from the server\'s disk? This cannot be undone.')) send({type:'delete', path:f});
+        };
+        d.appendChild(x);
+      }
       parent.appendChild(d);
     }
   };
@@ -110,6 +120,8 @@ function connect() {
       pendingSel = null;
       if (confirm(base(m.path) + ' must be converted to MP4 before it can play in the browser. This can take a while.' + (m.delete_source ? ' The original .mkv will be DELETED after the MP4 is checked.' : ' It uses disk space.') + ' Convert now?')) send({type:'select', path:m.path, convert:true});
     }
+    if (m.type === 'config') { canDelete = m.can_delete; renderLib(); }
+    if (m.type === 'deleted') { files = files.filter(f => f !== m.path); renderLib(); }
     if (m.type === 'error') flash(m.msg);
   };
 }

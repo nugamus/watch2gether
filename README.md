@@ -45,6 +45,7 @@ watch2gether [OPTIONS] [DIR]
 | `--bind <ADDR>` | `0.0.0.0` | Address to listen on |
 | `--password <PW>` / `W2G_PASSWORD` | | Password viewers must enter. Prefer the environment variable, so the password doesn't show up in the process list |
 | `--cache-dir <DIR>` | `~/.cache/watch2gether` | Where converted `.mkv` → `.mp4` copies are stored |
+| `--allow-delete` | | Show a 🗑 button next to each library file that permanently deletes it from disk, after a confirmation prompt. Any viewer can use it, so only enable it for people you trust |
 | `--delete-source` | | After converting an `.mkv`, save the MP4 next to it in the library and delete the original. The MP4 is checked first (has video, has audio if the original did, same duration), and the original is kept if the check fails. The folder must be writable |
 | `--no-auth` | | Turn off the password check. Anyone who can reach the port can join |
 

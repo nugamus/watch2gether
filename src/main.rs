@@ -44,6 +44,9 @@ struct Args {
     /// After converting an mkv, keep the MP4 next to it in the library and delete the original mkv
     #[arg(long)]
     delete_source: bool,
+    /// Let viewers delete video files from disk via the library (asks for confirmation first)
+    #[arg(long)]
+    allow_delete: bool,
     /// Allow anyone who can reach the port to join
     #[arg(long, conflicts_with = "password")]
     no_auth: bool,
@@ -181,6 +184,8 @@ enum In {
         #[serde(default)]
         convert: bool,
     },
+    /// Permanently delete a library file (only with `--allow-delete`).
+    Delete { path: String },
     Buffering,
     Ready { t: f64, seq: u64 },
     /// Escape hatch: stop waiting for whoever is stalled.
@@ -204,6 +209,8 @@ enum Out {
     /// `path` needs converting first; whoever picked it is asked before anything starts.
     Confirm { path: String, delete_source: bool },
     Error { msg: String },
+    Config { can_delete: bool },
+    Deleted { path: String },
     Viewers { n: usize },
 }
 
@@ -214,6 +221,7 @@ struct App {
     root: PathBuf,
     cache: PathBuf,
     delete_source: bool,
+    allow_delete: bool,
     /// Cache keys with a conversion in flight.
     jobs: Mutex<HashSet<String>>,
     room: Mutex<Room>,
@@ -261,6 +269,7 @@ async fn main() {
         root: root.clone(),
         cache: cache.clone(),
         delete_source: args.delete_source,
+        allow_delete: args.allow_delete,
         jobs: Mutex::new(HashSet::new()),
         room: Mutex::new(Room {
             file: None,
@@ -337,6 +346,8 @@ async fn client(socket: WebSocket, app: Shared) {
         r.buffering(id);
         r.snapshot(0)
     };
+    let config = serde_json::to_string(&Out::Config { can_delete: app.allow_delete }).unwrap();
+    let _ = sink.send(Message::text(config)).await;
     let _ = sink.send(Message::text(first.clone())).await;
     let _ = app.tx.send(first);
     broadcast_viewers(&app);
@@ -360,10 +371,14 @@ async fn client(socket: WebSocket, app: Shared) {
                 }
                 continue;
             }
+            if let In::Delete { path } = cmd {
+                delete(&app2, path);
+                continue;
+            }
             let out = {
                 let mut r = app2.room.lock().unwrap();
                 match cmd {
-                    In::Select { .. } => unreachable!(),
+                    In::Select { .. } | In::Delete { .. } => unreachable!(),
                     In::Buffering => r.buffering(id),
                     In::Ready { t, seq } => r.ready(id, t, seq),
                     In::Force => {
@@ -430,6 +445,40 @@ impl App {
 
     fn send(&self, out: &Out) {
         let _ = self.tx.send(serde_json::to_string(out).unwrap());
+    }
+}
+
+/// Remove a library file from disk and drop it from the room if it was playing.
+fn delete(app: &Shared, path: String) {
+    if !app.allow_delete {
+        app.send(&Out::Error { msg: "Deleting files is disabled (start with --allow-delete)".into() });
+        return;
+    }
+    if !is_video(&app.root, &path) {
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(app.root.join(&path)) {
+        app.send(&Out::Error { msg: format!("Could not delete {path}: {e}") });
+        return;
+    }
+    eprintln!("deleted {path}");
+    let snap = {
+        let mut r = app.room.lock().unwrap();
+        let current = r.file.as_deref() == Some(path.as_str())
+            || r.preparing.as_deref() == Some(path.as_str());
+        current.then(|| {
+            r.file = None;
+            r.cached = None;
+            r.preparing = None;
+            r.seq += 1;
+            r.clear_hold();
+            r.set(false, 0.0);
+            r.snapshot(0)
+        })
+    };
+    app.send(&Out::Deleted { path });
+    if let Some(snap) = snap {
+        let _ = app.tx.send(snap);
     }
 }
 
