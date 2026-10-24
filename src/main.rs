@@ -172,7 +172,12 @@ enum In {
     Play { t: f64 },
     Pause { t: f64 },
     Seek { t: f64 },
-    Select { path: String },
+    /// `convert` is set once the user has agreed to converting a file that needs it.
+    Select {
+        path: String,
+        #[serde(default)]
+        convert: bool,
+    },
     Buffering,
     Ready { t: f64, seq: u64 },
     /// Escape hatch: stop waiting for whoever is stalled.
@@ -193,6 +198,8 @@ enum Out {
         origin: u64,
     },
     Progress { path: String, pct: u8 },
+    /// `path` needs converting first; whoever picked it is asked before anything starts.
+    Confirm { path: String },
     Error { msg: String },
     Viewers { n: usize },
 }
@@ -342,9 +349,9 @@ async fn client(socket: WebSocket, app: Shared) {
         while let Some(Ok(msg)) = stream.next().await {
             let Message::Text(text) = msg else { continue };
             let Ok(cmd) = serde_json::from_str::<In>(&text) else { continue };
-            if let In::Select { path } = cmd {
+            if let In::Select { path, convert } = cmd {
                 if is_video(&app2.root, &path) {
-                    select(&app2, path, id).await;
+                    select(&app2, path, id, convert).await;
                 }
                 continue;
             }
@@ -421,7 +428,7 @@ impl App {
     }
 }
 
-async fn select(app: &Shared, path: String, id: u64) {
+async fn select(app: &Shared, path: String, id: u64, confirmed: bool) {
     if !convert::needs_conversion(&path) {
         app.switch_to(path, None, id);
         return;
@@ -431,6 +438,11 @@ async fn select(app: &Shared, path: String, id: u64) {
     let out = convert::cache_file(&app.cache, &key);
     if out.exists() {
         app.switch_to(path, Some(key), id);
+        return;
+    }
+    // Never start a conversion unasked; the picker is prompted and re-sends with `convert`.
+    if !confirmed && !app.jobs.lock().unwrap().contains(&key) {
+        app.send(&Out::Confirm { path });
         return;
     }
 

@@ -10,7 +10,7 @@ No uploads, no third-party service, nothing to install for viewers: they just op
 
 - **Strict sync.** Play, pause, seek and ±10s skips apply to everyone. If one viewer stalls or is still loading, the room freezes until they're ready, then resumes for all from the same position.
 - **Your files, streamed directly.** Videos are served straight from disk with HTTP range requests, so seeking is instant and nothing is re-encoded.
-- **Plays `.mkv` on iPhone.** Safari can't play Matroska, so `.mkv` files are converted to MP4 once on first play (video copied, audio turned into AAC) and cached. Later plays start instantly.
+- **Plays `.mkv` on iPhone.** Safari can't play Matroska, so `.mkv` files are converted to MP4 once on first play, after a confirmation prompt (video copied, audio turned into AAC) and cached. Later plays start instantly.
 - **Folder library.** Browse your video folder as a collapsible tree in the page, and pick what to watch together.
 - **Password protected.** Viewers log in with a shared password. Sessions last 30 days, and guessing is rate-limited.
 - **Works on phones.** Responsive layout with a collapsible library, inline playback on iPhone, and a tap-to-join prompt where the browser blocks autoplay.
@@ -49,7 +49,7 @@ watch2gether [OPTIONS] [DIR]
 
 The server refuses to start without a password unless `--no-auth` is given.
 
-Supported files: `.mp4`, `.m4v`, `.mov`, `.webm` (played as-is) and `.mkv` (converted on first play).
+Supported files: `.mp4`, `.m4v`, `.mov`, `.webm` (played as-is) and `.mkv` (asks before converting on first play).
 
 ## Running as a systemd service
 

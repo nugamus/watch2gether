@@ -85,7 +85,7 @@ function renderLib() {
       const d = document.createElement('div');
       d.textContent = name; d.title = f; d.dataset.f = f;
       d.className = 'file' + (f === curFile ? ' cur' : '');
-      d.onclick = () => { send({type:'select', path:f}); if (mobile.matches) setHidden(true); };
+      d.onclick = () => { pendingSel = f; send({type:'select', path:f}); if (mobile.matches) setHidden(true); };
       parent.appendChild(d);
     }
   };
@@ -94,6 +94,7 @@ function renderLib() {
   if (!files.length) lib.textContent = 'No videos found';
 }
 const expected = () => last.playing ? last.t + (performance.now()-last.at)/1000 : last.t;
+let pendingSel = null;
 const send = o => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
 
 function connect() {
@@ -105,6 +106,10 @@ function connect() {
     if (m.type === 'viewers') document.getElementById('viewers').textContent = m.n + ' watching';
     if (m.type === 'state') apply(m);
     if (m.type === 'progress') { document.getElementById('prepBar').style.width = m.pct + '%'; document.getElementById('prepText').textContent = 'Preparing ' + base(m.path) + '… ' + m.pct + '%'; }
+    if (m.type === 'confirm' && m.path === pendingSel) {
+      pendingSel = null;
+      if (confirm(base(m.path) + ' must be converted to MP4 before it can play in the browser. This can take a while and uses disk space. Convert now?')) send({type:'select', path:m.path, convert:true});
+    }
     if (m.type === 'error') flash(m.msg);
   };
 }
