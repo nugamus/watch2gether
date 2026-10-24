@@ -10,7 +10,6 @@ No uploads, no third-party service, nothing to install for viewers: they just op
 
 - **Strict sync.** Play, pause, seek and ±10s skips apply to everyone. If one viewer stalls or is still loading, the room freezes until they're ready, then resumes for all from the same position.
 - **Your files, streamed directly.** Videos are served straight from disk with HTTP range requests, so seeking is instant and nothing is re-encoded.
-- **Plays `.mkv` on iPhone.** Safari can't play Matroska, so `.mkv` files are converted to MP4 once on first play, after a confirmation prompt (video copied, audio turned into AAC) and cached. Later plays start instantly.
 - **Folder library.** Browse your video folder as a collapsible tree in the page, and pick what to watch together.
 - **Password protected.** Viewers log in with a shared password. Sessions last 30 days, and guessing is rate-limited.
 - **Works on phones.** Responsive layout with a collapsible library, inline playback on iPhone, and a tap-to-join prompt where the browser blocks autoplay.
@@ -19,7 +18,6 @@ No uploads, no third-party service, nothing to install for viewers: they just op
 ## Requirements
 
 - [Rust](https://rustup.rs) (edition 2024, so a recent toolchain)
-- [ffmpeg](https://ffmpeg.org) with `ffprobe` on your `PATH`, only needed to play `.mkv` files
 - A way for your friends to reach your computer: port forwarding, a tunnel such as Cloudflare Tunnel or Tailscale Funnel, or a reverse proxy. Use HTTPS in front of it, because the password is sent in plain text otherwise.
 
 ## Quick start
@@ -44,12 +42,11 @@ watch2gether [OPTIONS] [DIR]
 | `--port <PORT>` | `8080` | Port to listen on |
 | `--bind <ADDR>` | `0.0.0.0` | Address to listen on |
 | `--password <PW>` / `W2G_PASSWORD` | | Password viewers must enter. Prefer the environment variable, so the password doesn't show up in the process list |
-| `--cache-dir <DIR>` | `~/.cache/watch2gether` | Where converted `.mkv` → `.mp4` copies are stored |
 | `--no-auth` | | Turn off the password check. Anyone who can reach the port can join |
 
 The server refuses to start without a password unless `--no-auth` is given.
 
-Supported files: `.mp4`, `.m4v`, `.mov`, `.webm` (played as-is) and `.mkv` (asks before converting on first play).
+Supported files: `.mp4`, `.m4v`, `.mov`, `.webm` and `.mkv`. Files are always played as-is and never converted, so whether a file plays depends on the browser (e.g. Safari can't play `.mkv`).
 
 ## Running as a systemd service
 
@@ -91,8 +88,7 @@ The server holds the single source of truth for the room: which video, playing o
 ## Limitations
 
 - **Bandwidth.** Video is streamed at its original quality. A viewer needs a connection faster than the file's bitrate (roughly file size ÷ duration), otherwise the room will spend a lot of time waiting for them. 4K remuxes can be 15+ Mbit/s.
-- **`.mkv` conversion** keeps only the first audio track and drops subtitles. The first play of a large file takes a while (it's a one-time copy). The cache is never cleaned automatically, and each converted file takes about as much space as the original.
-- **Codecs.** Conversion changes the container, not the video codec. Very heavy files, such as 4K 10-bit HDR HEVC, may still be too much for some phones.
+- **Codecs.** Very heavy files, such as 4K 10-bit HDR HEVC, may still be too much for some phones.
 - **iPhone fullscreen** uses Safari's native player, which can't show anything the page draws on top.
 - **One room per server.** Everyone connected shares the same room.
 
@@ -100,7 +96,6 @@ The server holds the single source of truth for the room: which video, playing o
 
 ```
 src/main.rs        server: CLI, auth, WebSocket sync, room state, file library
-src/convert.rs     on-demand mkv → mp4 conversion with ffmpeg
 static/index.html  the player page (compiled into the binary)
 static/login.html  the login page
 deploy/            systemd user service

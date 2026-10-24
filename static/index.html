@@ -15,13 +15,9 @@
   video{flex:1;min-width:0;min-height:0;width:100%;height:100%;background:#000}
   #tap{position:absolute;inset:0;margin:auto;width:max-content;height:max-content;padding:14px 22px;font:inherit;font-size:16px;color:#fff;background:rgba(40,40,70,.92);border:1px solid #556;border-radius:8px;cursor:pointer}
   #tap[hidden]{display:none}
-  #prep{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:rgba(11,11,14,.88);text-align:center;padding:16px}
-  #prep[hidden]{display:none}
   #wait{position:absolute;top:10px;left:50%;transform:translateX(-50%);padding:6px 8px 6px 14px;border-radius:16px;background:rgba(20,20,30,.9);border:1px solid #445;font-size:13px;white-space:nowrap;display:flex;align-items:center;gap:8px}
   #force{font:inherit;font-size:12px;color:#ddd;background:#2a2a40;border:1px solid #445;border-radius:12px;padding:3px 10px;cursor:pointer}
   #wait[hidden]{display:none}
-  #prep .bar{width:min(260px,70%);height:6px;background:#2a2a35;border-radius:3px;overflow:hidden}
-  #prep .bar i{display:block;height:100%;width:0;background:#7a7aff;transition:width .4s}
   #bar{padding:6px 12px;display:flex;gap:16px;justify-content:space-between}
   #toggle{background:#1c1c24;color:#ddd;border:1px solid #333;border-radius:4px;padding:3px 10px;cursor:pointer;font:inherit}
   #toggle:hover{background:#2a2a40}
@@ -29,7 +25,7 @@
   #status.ok{color:#6c6}#status.bad{color:#e66}
 </style></head>
 <body>
-<div id="main"><div id="lib"></div><div id="stage"><video id="v" controls playsinline preload="auto"></video><button id="tap" type="button" hidden>▶ Tap to join playback</button><div id="wait" hidden><span id="waitText"></span> <button id="force" type="button">Resume anyway</button></div><div id="prep" hidden><div id="prepText"></div><div class="bar"><i id="prepBar"></i></div><small>Converting for browser playback (first time only)</small></div></div></div>
+<div id="main"><div id="lib"></div><div id="stage"><video id="v" controls playsinline preload="auto"></video><button id="tap" type="button" hidden>▶ Tap to join playback</button><div id="wait" hidden><span id="waitText"></span> <button id="force" type="button">Resume anyway</button></div></div></div>
 <div id="bar"><span id="status" class="bad">connecting…</span><button id="toggle" type="button">☰ Library</button><span id="viewers"></span></div>
 <script>
 const v = document.getElementById('v');
@@ -37,7 +33,6 @@ const tap = document.getElementById('tap');
 const status = document.getElementById('status');
 let localSeekAt = -1e9, remoteSeekT = null, lastSeq = -1;
 let ws, last = {playing:false, t:0, at:performance.now()}, curFile = null, curSrc = null;
-const prep = document.getElementById('prep');
 const waitText = document.getElementById('waitText');
 const base = f => f.split('/').pop();
 function flash(msg) {
@@ -85,7 +80,7 @@ function renderLib() {
       const d = document.createElement('div');
       d.textContent = name; d.title = f; d.dataset.f = f;
       d.className = 'file' + (f === curFile ? ' cur' : '');
-      d.onclick = () => { pendingSel = f; send({type:'select', path:f}); if (mobile.matches) setHidden(true); };
+      d.onclick = () => { send({type:'select', path:f}); if (mobile.matches) setHidden(true); };
       parent.appendChild(d);
     }
   };
@@ -94,7 +89,6 @@ function renderLib() {
   if (!files.length) lib.textContent = 'No videos found';
 }
 const expected = () => last.playing ? last.t + (performance.now()-last.at)/1000 : last.t;
-let pendingSel = null;
 const send = o => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
 
 function connect() {
@@ -105,20 +99,12 @@ function connect() {
     const m = JSON.parse(e.data);
     if (m.type === 'viewers') document.getElementById('viewers').textContent = m.n + ' watching';
     if (m.type === 'state') apply(m);
-    if (m.type === 'progress') { document.getElementById('prepBar').style.width = m.pct + '%'; document.getElementById('prepText').textContent = 'Preparing ' + base(m.path) + '… ' + m.pct + '%'; }
-    if (m.type === 'confirm' && m.path === pendingSel) {
-      pendingSel = null;
-      if (confirm(base(m.path) + ' must be converted to MP4 before it can play in the browser. This can take a while and uses disk space. Convert now?')) send({type:'select', path:m.path, convert:true});
-    }
     if (m.type === 'error') flash(m.msg);
   };
 }
 
 function apply(m) {
-  prep.hidden = !m.preparing;
-  if (m.preparing) { document.getElementById('prepText').textContent = 'Preparing ' + base(m.preparing) + '…'; }
-  else document.getElementById('prepBar').style.width = '0';
-  const src = m.cached ? '/cache/' + m.cached + '.mp4' : (m.file ? url(m.file) : null);
+  const src = m.file ? url(m.file) : null;
   const w = document.getElementById('wait');
   w.hidden = !m.waiting;
   if (m.waiting) waitText.textContent = '⏳ Waiting for ' + m.waiting + (m.waiting > 1 ? ' viewers' : ' viewer') + ' to buffer…';

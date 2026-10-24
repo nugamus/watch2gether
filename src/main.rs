@@ -23,8 +23,6 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
-mod convert;
-
 #[derive(Parser)]
 #[command(about = "Watch a local video together, in sync")]
 struct Args {
@@ -38,9 +36,6 @@ struct Args {
     /// Password viewers must enter (prefer the W2G_PASSWORD env var: it stays out of `ps`)
     #[arg(long, env = "W2G_PASSWORD", hide_env_values = true)]
     password: Option<String>,
-    /// Where converted (mkv -> mp4) copies are kept [default: ~/.cache/watch2gether]
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
     /// Allow anyone who can reach the port to join
     #[arg(long, conflicts_with = "password")]
     no_auth: bool,
@@ -70,10 +65,6 @@ impl Auth {
 struct Room {
     /// Library path of the selected video (for highlighting).
     file: Option<String>,
-    /// Cache key of the converted copy to load instead of `file`, if it needed conversion.
-    cached: Option<String>,
-    /// Library path currently being converted; playback is paused until it is ready.
-    preparing: Option<String>,
     playing: bool,
     pos: f64,
     at: Instant,
@@ -156,8 +147,6 @@ impl Room {
             playing: self.playing,
             t: self.position(),
             file: self.file.clone(),
-            cached: self.cached.clone(),
-            preparing: self.preparing.clone(),
             waiting: self.buffering.len(),
             seq: self.seq,
             origin,
@@ -172,12 +161,7 @@ enum In {
     Play { t: f64 },
     Pause { t: f64 },
     Seek { t: f64 },
-    /// `convert` is set once the user has agreed to converting a file that needs it.
-    Select {
-        path: String,
-        #[serde(default)]
-        convert: bool,
-    },
+    Select { path: String },
     Buffering,
     Ready { t: f64, seq: u64 },
     /// Escape hatch: stop waiting for whoever is stalled.
@@ -191,16 +175,10 @@ enum Out {
         playing: bool,
         t: f64,
         file: Option<String>,
-        cached: Option<String>,
-        preparing: Option<String>,
         waiting: usize,
         seq: u64,
         origin: u64,
     },
-    Progress { path: String, pct: u8 },
-    /// `path` needs converting first; whoever picked it is asked before anything starts.
-    Confirm { path: String },
-    Error { msg: String },
     Viewers { n: usize },
 }
 
@@ -209,9 +187,6 @@ struct App {
     /// Serializes login attempts so guessing is limited to ~1/sec.
     login_lock: tokio::sync::Mutex<()>,
     root: PathBuf,
-    cache: PathBuf,
-    /// Cache keys with a conversion in flight.
-    jobs: Mutex<HashSet<String>>,
     room: Mutex<Room>,
     tx: broadcast::Sender<String>,
     viewers: Mutex<usize>,
@@ -238,29 +213,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let cache = args.cache_dir.clone().unwrap_or_else(|| {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .unwrap_or_else(std::env::temp_dir)
-            .join("watch2gether")
-    });
-    if let Err(e) = std::fs::create_dir_all(&cache) {
-        eprintln!("cannot create cache dir {}: {e}", cache.display());
-        std::process::exit(1);
-    }
-    convert::clean_partials(&cache);
     let (tx, _) = broadcast::channel(64);
     let app = Arc::new(App {
         auth,
         login_lock: tokio::sync::Mutex::new(()),
         root: root.clone(),
-        cache: cache.clone(),
-        jobs: Mutex::new(HashSet::new()),
         room: Mutex::new(Room {
             file: None,
-            cached: None,
-            preparing: None,
             playing: false,
             pos: 0.0,
             at: Instant::now(),
@@ -295,14 +254,13 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .route("/api/files", get(list_files))
         .nest_service("/video", ServeDir::new(&root))
-        .nest_service("/cache", ServeDir::new(&cache))
         .route("/login", get(login_page).post(login_post))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app);
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-    println!("Sharing {} on http://{addr} (conversion cache: {})", root.display(), cache.display());
+    println!("Sharing {} on http://{addr}", root.display());
     axum::serve(listener, router).await.unwrap();
 }
 
@@ -349,9 +307,9 @@ async fn client(socket: WebSocket, app: Shared) {
         while let Some(Ok(msg)) = stream.next().await {
             let Message::Text(text) = msg else { continue };
             let Ok(cmd) = serde_json::from_str::<In>(&text) else { continue };
-            if let In::Select { path, convert } = cmd {
+            if let In::Select { path } = cmd {
                 if is_video(&app2.root, &path) {
-                    select(&app2, path, id, convert).await;
+                    app2.switch_to(path, id);
                 }
                 continue;
             }
@@ -408,12 +366,10 @@ async fn client(socket: WebSocket, app: Shared) {
 
 impl App {
     /// Make `path` the room's video, paused at 0:00, and tell everyone.
-    fn switch_to(&self, path: String, cached: Option<String>, origin: u64) {
+    fn switch_to(&self, path: String, origin: u64) {
         let msg = {
             let mut r = self.room.lock().unwrap();
             r.file = Some(path);
-            r.cached = cached;
-            r.preparing = None;
             r.seq += 1;
             r.clear_hold();
             r.buffering = r.clients.clone();
@@ -422,69 +378,6 @@ impl App {
         };
         let _ = self.tx.send(msg);
     }
-
-    fn send(&self, out: &Out) {
-        let _ = self.tx.send(serde_json::to_string(out).unwrap());
-    }
-}
-
-async fn select(app: &Shared, path: String, id: u64, confirmed: bool) {
-    if !convert::needs_conversion(&path) {
-        app.switch_to(path, None, id);
-        return;
-    }
-    let src = app.root.join(&path);
-    let Some(key) = convert::cache_key(&src, &path) else { return };
-    let out = convert::cache_file(&app.cache, &key);
-    if out.exists() {
-        app.switch_to(path, Some(key), id);
-        return;
-    }
-    // Never start a conversion unasked; the picker is prompted and re-sends with `convert`.
-    if !confirmed && !app.jobs.lock().unwrap().contains(&key) {
-        app.send(&Out::Confirm { path });
-        return;
-    }
-
-    // Pause everyone and show "preparing" while ffmpeg remuxes in the background.
-    let msg = {
-        let mut r = app.room.lock().unwrap();
-        r.preparing = Some(path.clone());
-        let p = r.position();
-        r.set(false, p);
-        r.snapshot(id)
-    };
-    let _ = app.tx.send(msg);
-    if !app.jobs.lock().unwrap().insert(key.clone()) {
-        return; // already converting; its completion handler will switch the room
-    }
-    let app = app.clone();
-    tokio::spawn(async move {
-        let p2 = path.clone();
-        let a2 = app.clone();
-        let res = convert::run(&src, &out, move |pct| {
-            a2.send(&Out::Progress { path: p2.clone(), pct })
-        })
-        .await;
-        app.jobs.lock().unwrap().remove(&key);
-        let still_wanted = app.room.lock().unwrap().preparing.as_deref() == Some(path.as_str());
-        match res {
-            Ok(()) if still_wanted => app.switch_to(path, Some(key), 0),
-            Ok(()) => {}
-            Err(msg) => {
-                eprintln!("conversion of {path} failed: {msg}");
-                if still_wanted {
-                    let snap = {
-                        let mut r = app.room.lock().unwrap();
-                        r.preparing = None;
-                        r.snapshot(0)
-                    };
-                    let _ = app.tx.send(snap);
-                }
-                app.send(&Out::Error { msg: format!("Could not convert {path}: {msg}") });
-            }
-        }
-    });
 }
 
 const EXTS: [&str; 5] = ["mp4", "webm", "mkv", "m4v", "mov"];
