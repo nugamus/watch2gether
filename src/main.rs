@@ -612,9 +612,19 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
     let _ = app.tx.send(first);
     broadcast_viewers(&app);
 
+    // Pings keep a quiet (paused) connection alive: reverse proxies such as nginx drop a
+    // WebSocket after 60 s without traffic.
     let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if sink.send(Message::text(msg)).await.is_err() {
+        let mut ping = tokio::time::interval(Duration::from_secs(25));
+        loop {
+            let out = tokio::select! {
+                msg = rx.recv() => match msg {
+                    Ok(msg) => Message::text(msg),
+                    Err(_) => break,
+                },
+                _ = ping.tick() => Message::Ping(Default::default()),
+            };
+            if sink.send(out).await.is_err() {
                 break;
             }
         }
