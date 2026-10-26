@@ -54,6 +54,9 @@ struct Args {
     /// Make everyone who can reach the port a host
     #[arg(long, conflicts_with = "password")]
     no_auth: bool,
+    /// Prepare videos ahead of time, and new ones once they finish copying in
+    #[arg(long, env = "W2G_PRECACHE", value_enum, default_value = "off")]
+    precache: Precache,
 }
 
 struct Auth {
@@ -100,12 +103,16 @@ struct SubTrack {
 }
 
 struct Current {
+    /// Library path, so a change of quality can prepare the same video again.
+    rel: String,
     /// Stable id of the video (also keys its subtitles and offset in the store).
     vid: String,
     title: String,
     /// Random per session/video: media URLs are `/m/<nonce>/...`, so old ones die on every switch.
     nonce: String,
     media: Media,
+    /// Prepared 720p copy of an HLS video, offered as a second quality.
+    lite: Option<PathBuf>,
     subs: Vec<SubTrack>,
     skipped: Vec<String>,
     offset: f64,
@@ -127,6 +134,10 @@ impl Current {
         match &self.media {
             Media::Direct(p) => (rest == "video").then(|| p.clone()),
             Media::Hls(dir) => {
+                let (dir, rest) = match (rest.strip_prefix("lite/"), &self.lite) {
+                    (Some(r), Some(l)) => (l, r),
+                    _ => (dir, rest),
+                };
                 let rel = Path::new(rest);
                 let safe =
                     !rest.is_empty() && rel.components().all(|c| matches!(c, Component::Normal(_)));
@@ -139,7 +150,13 @@ impl Current {
         let base = format!("/m/{}/", self.nonce);
         MediaOut {
             vid: self.vid.clone(),
+            // Names the prepared folder, so a viewer's preloaded copy survives a new nonce.
+            key: match &self.media {
+                Media::Hls(dir) => dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+                Media::Direct(_) => None,
+            },
             title: self.title.clone(),
+            lite: self.lite.is_some(),
             src: match self.media {
                 Media::Direct(_) => format!("{base}video"),
                 Media::Hls(_) => format!("{base}master.m3u8"),
@@ -192,6 +209,24 @@ struct Room {
     /// Bumped on every deliberate position change (seek, new video) so clients can tell those
     /// apart from the room merely pausing to wait for someone.
     seq: u64,
+    /// How the host wants videos delivered (all off = the original behaviour).
+    mode: Mode,
+    /// Preload progress per viewer: percent and download speed in Mbit/s.
+    loaded: HashMap<u64, (u8, f32)>,
+}
+
+/// Room settings for viewers on slow or distant connections.
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+struct Mode {
+    /// Also offer a 720p ~1.3 Mbit/s copy; each viewer picks (or lets the player pick).
+    #[serde(default)]
+    lite: bool,
+    /// Every viewer downloads the whole video before the room starts.
+    #[serde(default)]
+    preload: bool,
+    /// Bigger buffers and stricter "ready" checks for high-latency viewers.
+    #[serde(default)]
+    slow: bool,
 }
 
 impl Room {
@@ -209,6 +244,8 @@ impl Room {
             buffering: HashSet::new(),
             resume: false,
             seq: 0,
+            mode: Mode::default(),
+            loaded: HashMap::new(),
         }
     }
 
@@ -280,6 +317,7 @@ impl Room {
         self.preparing = None;
         self.seq += 1;
         self.clear_hold();
+        self.loaded.clear();
         if self.current.is_some() {
             self.buffering = self.clients.clone();
         }
@@ -307,8 +345,27 @@ impl Room {
             waiting,
             seq: self.seq,
             origin,
+            mode: self.mode,
         })
         .unwrap()
+    }
+
+    fn loaded_msg(&self) -> String {
+        let mut list: Vec<LoadedOut> = self
+            .loaded
+            .iter()
+            .map(|(id, &(pct, mbps))| LoadedOut {
+                name: self
+                    .names
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| "someone".into()),
+                pct,
+                mbps,
+            })
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        serde_json::to_string(&Out::Loaded { list }).unwrap()
     }
 }
 
@@ -344,7 +401,16 @@ enum In {
     React {
         r: String,
     },
+    /// Preload progress of this viewer.
+    Loaded {
+        pct: u8,
+        mbps: f32,
+    },
     // Host only:
+    Mode {
+        #[serde(flatten)]
+        mode: Mode,
+    },
     Select {
         path: String,
     },
@@ -362,6 +428,9 @@ enum In {
 #[derive(Serialize)]
 struct MediaOut {
     vid: String,
+    key: Option<String>,
+    /// A 720p quality is offered next to the original.
+    lite: bool,
     title: String,
     src: String,
     subs: Vec<SubOut>,
@@ -391,6 +460,11 @@ enum Out {
         waiting: Vec<String>,
         seq: u64,
         origin: u64,
+        mode: Mode,
+    },
+    /// Who has preloaded how much of the current video.
+    Loaded {
+        list: Vec<LoadedOut>,
     },
     Progress {
         pct: u8,
@@ -411,6 +485,13 @@ enum Out {
         name: String,
         r: String,
     },
+}
+
+#[derive(Serialize)]
+struct LoadedOut {
+    name: String,
+    pct: u8,
+    mbps: f32,
 }
 
 #[derive(Serialize, Clone)]
@@ -503,6 +584,10 @@ async fn main() {
             }
         }
     });
+
+    if args.precache != Precache::Off {
+        tokio::spawn(precache(app.clone(), args.precache));
+    }
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
@@ -680,6 +765,9 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
         r.clients.remove(&id);
         r.names.remove(&id);
         r.reacted.remove(&id);
+        if r.loaded.remove(&id).is_some() {
+            let _ = app.tx.send(r.loaded_msg());
+        }
         r.buffering.remove(&id).then(|| {
             r.try_resume();
             r.snapshot(0)
@@ -737,7 +825,37 @@ async fn handle(app: &Shared, id: u64, role: &Role, cmd: In) {
             }
             app.refresh_uploads()
         }
-        In::Select { .. } | In::End | In::Offset { .. } | In::Subremove { .. } => return,
+        In::Mode { mode } if host => {
+            let (rel, again) = {
+                let mut r = app.room.lock().unwrap();
+                let old = std::mem::replace(&mut r.mode, mode);
+                let cur = r.current.as_ref();
+                // A new quality, or preload of a file that is played as-is, needs another copy.
+                let again = cur.is_some_and(|c| {
+                    old.lite != mode.lite || (mode.preload && matches!(c.media, Media::Direct(_)))
+                });
+                (cur.map(|c| c.rel.clone()), again)
+            };
+            if let (Some(rel), true) = (rel, again) {
+                select(app, rel, id).await;
+                return;
+            }
+            app.room.lock().unwrap().snapshot(id)
+        }
+        In::Select { .. }
+        | In::End
+        | In::Offset { .. }
+        | In::Subremove { .. }
+        | In::Mode { .. } => return,
+        In::Loaded { pct, mbps } => {
+            let mut r = app.room.lock().unwrap();
+            if r.current.is_none() {
+                return;
+            }
+            r.loaded
+                .insert(id, (pct.min(100), mbps.clamp(0.0, 10_000.0)));
+            r.loaded_msg()
+        }
         In::Failed { msg } => {
             let name = app
                 .room
@@ -919,8 +1037,17 @@ impl App {
         let offset = self
             .store
             .read(|d| d.offsets.get(&vid).copied().unwrap_or(0.0));
+        let want_lite = self.room.lock().unwrap().mode.lite;
+        let lite = match &media {
+            Media::Hls(dir) if want_lite => {
+                Some(lite_dir(dir)).filter(|l| l.join("master.m3u8").exists())
+            }
+            _ => None,
+        };
         let cur = Current {
+            lite,
             title: title_of(&rel),
+            rel: rel.clone(),
             vid,
             nonce: store::random_token(16),
             media,
@@ -959,7 +1086,8 @@ async fn select(app: &Shared, path: String, id: u64) {
             });
         }
     };
-    if convert::direct_play(&path, &info) {
+    let mode = app.room.lock().unwrap().mode;
+    if !mode.lite && !mode.preload && convert::direct_play(&path, &info) {
         app.activate(path, Media::Direct(src), convert::Meta::default(), id)
             .await;
         return;
@@ -968,7 +1096,8 @@ async fn select(app: &Shared, path: String, id: u64) {
         return;
     };
     let dir = app.cache.join(&key);
-    if let Some(meta) = convert::load_meta(&dir) {
+    let need_lite = mode.lite && !lite_dir(&dir).join("master.m3u8").exists();
+    if let Some(meta) = convert::load_meta(&dir).filter(|_| !need_lite) {
         app.activate(path, Media::Hls(dir), meta, id).await;
         return;
     }
@@ -982,37 +1111,154 @@ async fn select(app: &Shared, path: String, id: u64) {
         r.snapshot(id)
     };
     let _ = app.tx.send(msg);
+    // If it is already being prepared (e.g. by precache), that job switches the room when done.
+    tokio::spawn(prepare(app.clone(), path, src, dir, need_lite));
+}
+
+/// Prepare the HLS folder `dir` (and its lite copy) for library file `path`. Switches the room to
+/// it if the room is waiting for it. Returns false if ffmpeg failed.
+async fn prepare(app: Shared, path: String, src: PathBuf, dir: PathBuf, need_lite: bool) -> bool {
+    let key = dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     if !app.jobs.lock().unwrap().insert(key.clone()) {
-        return; // already converting; its completion handler will switch the room
+        return true;
     }
-    let app = app.clone();
-    tokio::spawn(async move {
-        let a2 = app.clone();
-        let res = convert::run(&src, &dir, app.encoder, move |pct| {
+    let wanted = |app: &App| app.room.lock().unwrap().preparing.as_deref() == Some(path.as_str());
+    let a2 = app.clone();
+    let progress = |pct| {
+        if wanted(&a2) {
             a2.send(&Out::Progress { pct })
-        })
-        .await;
-        app.jobs.lock().unwrap().remove(&key);
-        let still_wanted = app.room.lock().unwrap().preparing.as_deref() == Some(path.as_str());
-        match res {
-            Ok(meta) if still_wanted => app.activate(path, Media::Hls(dir), meta, 0).await,
-            Ok(_) => {}
-            Err(msg) => {
-                eprintln!("conversion of {path} failed: {msg}");
-                if still_wanted {
-                    let snap = {
-                        let mut r = app.room.lock().unwrap();
-                        r.preparing = None;
-                        r.snapshot(0)
-                    };
-                    let _ = app.tx.send(snap);
+        }
+    };
+    let res = async {
+        let meta = match convert::load_meta(&dir) {
+            Some(m) => m,
+            None => convert::run(&src, &dir, app.encoder, false, &progress).await?,
+        };
+        if need_lite {
+            convert::run(&src, &lite_dir(&dir), app.encoder, true, &progress).await?;
+        }
+        Ok::<_, String>(meta)
+    }
+    .await;
+    app.jobs.lock().unwrap().remove(&key);
+    let still_wanted = wanted(&app);
+    match res {
+        Ok(meta) if still_wanted => {
+            let lite_missing =
+                app.room.lock().unwrap().mode.lite && !lite_dir(&dir).join("master.m3u8").exists();
+            if lite_missing {
+                // The room asked for a lite copy while this job (precache) only made the original.
+                let lite = convert::run(&src, &lite_dir(&dir), app.encoder, true, &progress).await;
+                if let Err(e) = lite {
+                    eprintln!("lite copy of {path} failed: {e}");
                 }
+            }
+            app.activate(path, Media::Hls(dir), meta, 0).await;
+            true
+        }
+        Ok(_) => true,
+        Err(msg) => {
+            eprintln!("conversion of {path} failed: {msg}");
+            if still_wanted {
+                let snap = {
+                    let mut r = app.room.lock().unwrap();
+                    r.preparing = None;
+                    r.snapshot(0)
+                };
+                let _ = app.tx.send(snap);
                 app.send(&Out::Error {
                     msg: format!("Could not prepare {}: {msg}", title_of(&path)),
                 });
             }
+            false
         }
-    });
+    }
+}
+
+/// What the server prepares ahead of time, so picking a video starts it at once.
+#[derive(Clone, Copy, PartialEq, Debug, clap::ValueEnum)]
+enum Precache {
+    Off,
+    /// HLS copies of every video browsers can't play as-is.
+    Original,
+    /// HLS copies of every video plus their 720p lite copies.
+    Lite,
+}
+
+/// Library files whose size and mtime were the same last round: anything still being copied in
+/// keeps changing, so it is only prepared once it has been left alone for a whole round.
+type Seen = HashMap<String, (u64, std::time::SystemTime)>;
+
+/// Prepare every video in the library, one at a time, and keep doing it as files are added.
+async fn precache(app: Shared, what: Precache) {
+    let (mut seen, mut failed) = (Seen::new(), HashSet::new());
+    loop {
+        precache_round(&app, what, &mut seen, &mut failed).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+async fn precache_round(
+    app: &Shared,
+    what: Precache,
+    seen: &mut Seen,
+    failed: &mut HashSet<String>,
+) {
+    let root = app.root.clone();
+    let files = tokio::task::spawn_blocking(move || {
+        let mut v = Vec::new();
+        scan(&root, &root, &mut v);
+        v
+    })
+    .await
+    .unwrap_or_default();
+    seen.retain(|rel, _| files.contains(rel));
+    for rel in files {
+        let src = app.root.join(&rel);
+        let Some(sig) = std::fs::metadata(&src)
+            .ok()
+            .and_then(|m| Some((m.len(), m.modified().ok()?)))
+        else {
+            continue;
+        };
+        if seen.insert(rel.clone(), sig) != Some(sig) {
+            continue; // new or still changing
+        }
+        let Some(key) = convert::cache_key(&src, &rel) else {
+            continue;
+        };
+        let dir = app.cache.join(&key);
+        let need_lite = what == Precache::Lite && !lite_dir(&dir).join("master.m3u8").exists();
+        if failed.contains(&key) || (convert::load_meta(&dir).is_some() && !need_lite) {
+            continue;
+        }
+        if what == Precache::Original
+            && convert::probe(&src)
+                .await
+                .is_ok_and(|p| convert::direct_play(&rel, &p))
+        {
+            continue;
+        }
+        // Stay out of the way of a conversion the room is waiting for.
+        while !app.jobs.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        println!("precaching {rel}");
+        if !prepare(app.clone(), rel, src, dir, need_lite).await {
+            failed.insert(key);
+        }
+    }
+}
+
+/// Where the 720p copy of the HLS folder `dir` lives.
+fn lite_dir(dir: &Path) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push("-lite");
+    dir.with_file_name(name)
 }
 
 /// Serves the current video's files, and nothing else, to anyone in the room.
@@ -1021,16 +1267,41 @@ async fn media(
     UrlPath((nonce, rest)): UrlPath<(String, String)>,
     req: Request,
 ) -> Response {
-    let target = app
-        .room
-        .lock()
-        .unwrap()
-        .current
-        .as_ref()
-        .and_then(|c| c.resolve(&nonce, &rest));
+    let (target, lite) = {
+        let r = app.room.lock().unwrap();
+        let c = r.current.as_ref();
+        let target = c.and_then(|c| c.resolve(&nonce, &rest));
+        (
+            target,
+            c.and_then(|c| c.lite.clone())
+                .filter(|_| rest == "master.m3u8"),
+        )
+    };
+    if let (Some(p), Some(l)) = (&target, lite) {
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+        let body = convert::combined_master(&read(p), &read(&l.join("master.m3u8")));
+        return (
+            [
+                (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                (header::CACHE_CONTROL, "private, max-age=86400, immutable"),
+            ],
+            body,
+        )
+            .into_response();
+    }
     match target {
         Some(p) => match ServeFile::new(p).oneshot(req).await {
-            Ok(res) => res.map(Body::new),
+            Ok(mut res) => {
+                // A nonce URL always names the same bytes, so browsers can keep what they have
+                // instead of downloading it again after a seek. `private`: never in a shared cache.
+                if res.status().is_success() {
+                    res.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        header::HeaderValue::from_static("private, max-age=86400, immutable"),
+                    );
+                }
+                res.map(Body::new)
+            }
             Err(e) => match e {},
         },
         None => StatusCode::NOT_FOUND.into_response(),
@@ -1756,6 +2027,109 @@ mod tests {
             .await
             .unwrap();
         assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn slow_link_modes_are_host_only_and_media_is_cacheable() {
+        let t = setup();
+        let cmd: In =
+            serde_json::from_str(r#"{"type":"mode","lite":false,"preload":false,"slow":true}"#)
+                .unwrap();
+        handle(&t.app, 5, &Role::Guest { sid: "x".into() }, cmd).await;
+        assert!(
+            !t.app.room.lock().unwrap().mode.slow,
+            "guests can't change the mode"
+        );
+        let cmd: In = serde_json::from_str(r#"{"type":"mode","slow":true}"#).unwrap();
+        handle(&t.app, 1, &Role::Host, cmd).await;
+        assert!(t.app.room.lock().unwrap().mode.slow);
+        assert!(
+            t.app
+                .room
+                .lock()
+                .unwrap()
+                .snapshot(0)
+                .contains(r#""slow":true"#)
+        );
+
+        let root = t.app.root.clone();
+        t.app
+            .activate(
+                "a.mp4".into(),
+                Media::Direct(root.join("a.mp4")),
+                Default::default(),
+                0,
+            )
+            .await;
+        let nonce = t
+            .app
+            .room
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .nonce
+            .clone();
+        let res = get(
+            &t.app,
+            &format!("/m/{nonce}/video"),
+            Some(&host_cookie(&t.app)),
+        )
+        .await;
+        assert_eq!(
+            res.headers()[header::CACHE_CONTROL],
+            "private, max-age=86400, immutable"
+        );
+
+        handle(
+            &t.app,
+            7,
+            &Role::Host,
+            In::Loaded {
+                pct: 140,
+                mbps: 3.5,
+            },
+        )
+        .await;
+        let msg = t.app.room.lock().unwrap().loaded_msg();
+        assert!(msg.contains(r#""pct":100"#), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn precache_waits_for_copies_to_finish_then_prepares() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return eprintln!("ffmpeg not installed; skipping");
+        }
+        let t = setup();
+        let src = t.app.root.join("new.mkv");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:d=1"])
+            .args(["-c:v", "libx264"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let key = convert::cache_key(&src, "new.mkv").unwrap();
+        let (mut seen, mut failed) = (Seen::new(), HashSet::new());
+        precache_round(&t.app, Precache::Lite, &mut seen, &mut failed).await;
+        assert!(
+            !t.app.cache.join(&key).exists(),
+            "not touched on first sight: it may still be copying"
+        );
+        precache_round(&t.app, Precache::Lite, &mut seen, &mut failed).await;
+        assert!(convert::load_meta(&t.app.cache.join(&key)).is_some());
+        assert!(
+            lite_dir(&t.app.cache.join(&key))
+                .join("master.m3u8")
+                .exists()
+        );
+        // a.mp4 / b.mp4 are not real videos: they fail once and are not retried every round.
+        assert_eq!(failed.len(), 2);
     }
 
     #[tokio::test]
