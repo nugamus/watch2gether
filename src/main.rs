@@ -150,11 +150,6 @@ impl Current {
         let base = format!("/m/{}/", self.nonce);
         MediaOut {
             vid: self.vid.clone(),
-            // Names the prepared folder, so a viewer's preloaded copy survives a new nonce.
-            key: match &self.media {
-                Media::Hls(dir) => dir.file_name().map(|n| n.to_string_lossy().into_owned()),
-                Media::Direct(_) => None,
-            },
             title: self.title.clone(),
             lite: self.lite.is_some(),
             src: match self.media {
@@ -211,8 +206,6 @@ struct Room {
     seq: u64,
     /// How the host wants videos delivered (all off = the original behaviour).
     mode: Mode,
-    /// Preload progress per viewer: percent and download speed in Mbit/s.
-    loaded: HashMap<u64, (u8, f32)>,
 }
 
 /// Room settings for viewers on slow or distant connections.
@@ -221,9 +214,6 @@ struct Mode {
     /// Also offer a 720p ~1.3 Mbit/s copy; each viewer picks (or lets the player pick).
     #[serde(default)]
     lite: bool,
-    /// Every viewer downloads the whole video before the room starts.
-    #[serde(default)]
-    preload: bool,
     /// Bigger buffers and stricter "ready" checks for high-latency viewers.
     #[serde(default)]
     slow: bool,
@@ -245,7 +235,6 @@ impl Room {
             resume: false,
             seq: 0,
             mode: Mode::default(),
-            loaded: HashMap::new(),
         }
     }
 
@@ -317,7 +306,6 @@ impl Room {
         self.preparing = None;
         self.seq += 1;
         self.clear_hold();
-        self.loaded.clear();
         if self.current.is_some() {
             self.buffering = self.clients.clone();
         }
@@ -348,24 +336,6 @@ impl Room {
             mode: self.mode,
         })
         .unwrap()
-    }
-
-    fn loaded_msg(&self) -> String {
-        let mut list: Vec<LoadedOut> = self
-            .loaded
-            .iter()
-            .map(|(id, &(pct, mbps))| LoadedOut {
-                name: self
-                    .names
-                    .get(id)
-                    .cloned()
-                    .unwrap_or_else(|| "someone".into()),
-                pct,
-                mbps,
-            })
-            .collect();
-        list.sort_by(|a, b| a.name.cmp(&b.name));
-        serde_json::to_string(&Out::Loaded { list }).unwrap()
     }
 }
 
@@ -401,11 +371,6 @@ enum In {
     React {
         r: String,
     },
-    /// Preload progress of this viewer.
-    Loaded {
-        pct: u8,
-        mbps: f32,
-    },
     // Host only:
     Mode {
         #[serde(flatten)]
@@ -428,7 +393,6 @@ enum In {
 #[derive(Serialize)]
 struct MediaOut {
     vid: String,
-    key: Option<String>,
     /// A 720p quality is offered next to the original.
     lite: bool,
     title: String,
@@ -462,10 +426,6 @@ enum Out {
         origin: u64,
         mode: Mode,
     },
-    /// Who has preloaded how much of the current video.
-    Loaded {
-        list: Vec<LoadedOut>,
-    },
     Progress {
         pct: u8,
     },
@@ -485,13 +445,6 @@ enum Out {
         name: String,
         r: String,
     },
-}
-
-#[derive(Serialize)]
-struct LoadedOut {
-    name: String,
-    pct: u8,
-    mbps: f32,
 }
 
 #[derive(Serialize, Clone)]
@@ -765,9 +718,6 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
         r.clients.remove(&id);
         r.names.remove(&id);
         r.reacted.remove(&id);
-        if r.loaded.remove(&id).is_some() {
-            let _ = app.tx.send(r.loaded_msg());
-        }
         r.buffering.remove(&id).then(|| {
             r.try_resume();
             r.snapshot(0)
@@ -830,10 +780,8 @@ async fn handle(app: &Shared, id: u64, role: &Role, cmd: In) {
                 let mut r = app.room.lock().unwrap();
                 let old = std::mem::replace(&mut r.mode, mode);
                 let cur = r.current.as_ref();
-                // A new quality, or preload of a file that is played as-is, needs another copy.
-                let again = cur.is_some_and(|c| {
-                    old.lite != mode.lite || (mode.preload && matches!(c.media, Media::Direct(_)))
-                });
+                // Offering (or no longer offering) the lite copy needs the video prepared again.
+                let again = cur.is_some() && old.lite != mode.lite;
                 (cur.map(|c| c.rel.clone()), again)
             };
             if let (Some(rel), true) = (rel, again) {
@@ -847,15 +795,6 @@ async fn handle(app: &Shared, id: u64, role: &Role, cmd: In) {
         | In::Offset { .. }
         | In::Subremove { .. }
         | In::Mode { .. } => return,
-        In::Loaded { pct, mbps } => {
-            let mut r = app.room.lock().unwrap();
-            if r.current.is_none() {
-                return;
-            }
-            r.loaded
-                .insert(id, (pct.min(100), mbps.clamp(0.0, 10_000.0)));
-            r.loaded_msg()
-        }
         In::Failed { msg } => {
             let name = app
                 .room
@@ -1087,7 +1026,7 @@ async fn select(app: &Shared, path: String, id: u64) {
         }
     };
     let mode = app.room.lock().unwrap().mode;
-    if !mode.lite && !mode.preload && convert::direct_play(&path, &info) {
+    if !mode.lite && convert::direct_play(&path, &info) {
         app.activate(path, Media::Direct(src), convert::Meta::default(), id)
             .await;
         return;
@@ -2032,9 +1971,7 @@ mod tests {
     #[tokio::test]
     async fn slow_link_modes_are_host_only_and_media_is_cacheable() {
         let t = setup();
-        let cmd: In =
-            serde_json::from_str(r#"{"type":"mode","lite":false,"preload":false,"slow":true}"#)
-                .unwrap();
+        let cmd: In = serde_json::from_str(r#"{"type":"mode","lite":false,"slow":true}"#).unwrap();
         handle(&t.app, 5, &Role::Guest { sid: "x".into() }, cmd).await;
         assert!(
             !t.app.room.lock().unwrap().mode.slow,
@@ -2081,19 +2018,6 @@ mod tests {
             res.headers()[header::CACHE_CONTROL],
             "private, max-age=86400, immutable"
         );
-
-        handle(
-            &t.app,
-            7,
-            &Role::Host,
-            In::Loaded {
-                pct: 140,
-                mbps: 3.5,
-            },
-        )
-        .await;
-        let msg = t.app.room.lock().unwrap().loaded_msg();
-        assert!(msg.contains(r#""pct":100"#), "{msg}");
     }
 
     #[tokio::test]
