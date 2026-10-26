@@ -204,8 +204,10 @@ const send = o => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
 function connect() {
   ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws');
   ws.onopen = () => { resetBuffering(); lastSeq = -1; connected = true; status(); };
-  ws.onclose = () => {
-    connected = false; status();
+  ws.onclose = e => {
+    connected = false;
+    if (e.code === 4001) { replaced = true; v.pause(); status(); return; } // host opened another window
+    status();
     // Revoked or expired link: the page itself now redirects to the login page with a note.
     fetch('/', {method: 'HEAD'}).then(r => { if (r.redirected) location.href = r.url; }).catch(() => {});
     setTimeout(connect, 1000);
@@ -222,7 +224,11 @@ function connect() {
   };
 }
 
+let pageBuild = null;
 function welcome(m) {
+  // The server was updated while this page was open: load the new page rather than run old code.
+  if (pageBuild !== null && m.build !== pageBuild) { location.reload(); return; }
+  pageBuild = m.build;
   isHost = m.host;
   $('build').textContent = m.build ? 'build ' + m.build : '';
   $('libBtn').hidden = !isHost;
@@ -366,8 +372,15 @@ for (const i of document.querySelectorAll('#modes input')) i.onchange = () => {
 };
 
 // ---- status: top-left line and centre ----
+let replaced = false;
 function status() {
   const st = $('stat');
+  if (replaced) {
+    st.textContent = '';
+    center.innerHTML = 'You opened the room in another window.<br><button id="tap" type="button">Use this window instead</button>';
+    $('tap').onclick = () => { replaced = false; center.innerHTML = ''; connect(); };
+    return;
+  }
   if (!connected) st.textContent = 'Reconnecting…';
   else if (room && room.waiting.length) {
     st.innerHTML = 'Waiting for ' + esc(room.waiting.join(', ')) + ' to buffer…<button type="button" id="force">Resume anyway</button>';
