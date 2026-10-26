@@ -70,6 +70,7 @@ services:
       - "8096:8080"
     environment:
       W2G_PASSWORD: change-me
+      W2G_PRECACHE: lite      # optional: off (default), original or lite
     volumes:
       - /DATA/Media/Movies:/videos:ro
       - /DATA/AppData/watch2gether/cache:/cache
@@ -121,6 +122,16 @@ A systemd user service is in `deploy/` (see the comments in it).
 ## Bandwidth
 
 Copied video streams at its original bitrate (file size ÷ duration: a 2 GB, 2.5-hour movie is about 1.8 Mbit/s). Transcoded video gets about 1.5× the source bitrate, capped at 5 Mbit/s. Each viewer's connection needs to keep up with that. If it can't, strict sync makes the room wait rather than letting the slow viewer fall behind. The player keeps up to a minute of video buffered ahead. hls.js is compiled into the binary, so nothing loads from a CDN (some are blocked in China).
+
+### Viewers on slow or distant connections
+
+The host's library panel has three switches under **Slow connections**. All are off by default.
+
+- **Offer a smaller 720p copy**: the server makes a 720p, ~1.3 Mbit/s copy once (about 1 GB for a 2-hour film) and offers it next to the original. Each viewer has a **Quality** button: *Auto* (the default) lets the player pick by that viewer's speed, so fast viewers keep the original and slow ones get 720p without choosing anything.
+- **Download the movie before starting**: every viewer downloads the whole video into the browser first (it needs that much free disk space), with their progress shown to the room. Nobody can stall mid-film after that. On *Auto*, a viewer whose connection is too slow for the original gets the 720p copy instead.
+- **Extra buffering for distant viewers**: wait for 10 s of video (not 3 s) before counting someone as ready, and keep up to 10 minutes buffered.
+
+`W2G_PRECACHE` prepares the library ahead of time so choosing a video starts at once: `original` makes HLS copies of everything browsers can't play as-is, `lite` also makes the 720p copies. New files are picked up within two minutes, once their size has stopped changing (so a file that is still being copied in is left alone). One file is prepared at a time, and only while nobody is waiting for a conversion.
 
 ## How sync works
 
