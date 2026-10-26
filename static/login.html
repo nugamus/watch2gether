@@ -16,5 +16,5 @@
   <p id="err"></p>
   <button type="submit">Enter</button>
 </form>
-<script>if (new URLSearchParams(location.search).has('e')) document.getElementById('err').textContent = 'Wrong password';</script>
+<script>const e = new URLSearchParams(location.search).get('e'); if (e) document.getElementById('err').textContent = e === '2' ? 'Your link no longer works. Ask the host for a new one.' : 'Wrong password';</script>
 </body></html>

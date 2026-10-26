@@ -37,7 +37,7 @@ const v = document.getElementById('v');
 const tap = document.getElementById('tap');
 const status = document.getElementById('status');
 let localSeekAt = -1e9, remoteSeekT = null, lastSeq = -1;
-let ws, last = {playing:false, t:0, at:performance.now()}, curFile = null, curSrc = null;
+let ws, last = {playing:false, t:0, at:performance.now()}, curFile = null, curSrc = null, prepTitle = '';
 const prep = document.getElementById('prep');
 const waitText = document.getElementById('waitText');
 const base = f => f.split('/').pop();
@@ -46,7 +46,6 @@ function flash(msg) {
   setTimeout(() => { if (ws && ws.readyState === 1) { status.textContent = 'connected'; status.className = 'ok'; } }, 10000);
 }
 const lib = document.getElementById('lib');
-const url = f => '/video/' + f.split(/[\\/]/).map(encodeURIComponent).join('/');
 const main = document.getElementById('main');
 const mobile = matchMedia('(max-width:700px)');
 function setHidden(h) {
@@ -57,9 +56,11 @@ function setHidden(h) {
 document.getElementById('toggle').onclick = () => setHidden(!main.classList.contains('hide'));
 try { setHidden(localStorage.getItem('w2g-hide') === '1'); } catch { setHidden(false); }
 
-let files = [];
+let files = [], vidOf = {};
 async function loadLib() {
   files = await (await fetch('/api/files')).json();
+  vidOf = Object.fromEntries(files.map(f => [f.vid, f.path]));
+  files = files.map(f => f.path);
   renderLib();
 }
 function renderLib() {
@@ -103,9 +104,10 @@ function connect() {
   ws.onclose = () => { status.textContent='disconnected, retrying…'; status.className='bad'; setTimeout(connect, 1000); };
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
+    if (m.type === 'welcome') { document.getElementById('toggle').hidden = !m.host; if (m.host) loadLib(); else { lib.remove(); } }
     if (m.type === 'viewers') document.getElementById('viewers').textContent = m.n + ' watching';
     if (m.type === 'state') apply(m);
-    if (m.type === 'progress') { document.getElementById('prepBar').style.width = m.pct + '%'; document.getElementById('prepText').textContent = 'Preparing ' + base(m.path) + '… ' + m.pct + '%'; }
+    if (m.type === 'progress') { document.getElementById('prepBar').style.width = m.pct + '%'; document.getElementById('prepText').textContent = 'Preparing ' + prepTitle + '… ' + m.pct + '%'; }
     if (m.type === 'error') flash(m.msg);
   };
 }
@@ -126,15 +128,16 @@ function load(src) {
 v.addEventListener('error', () => { if (curSrc && v.error) send({type:'failed', msg: 'decode error ' + v.error.code + ' ' + (v.error.message || '')}); });
 function apply(m) {
   prep.hidden = !m.preparing;
-  if (m.preparing) { document.getElementById('prepText').textContent = 'Preparing ' + base(m.preparing) + '…'; }
+  if (m.preparing && m.preparing !== prepTitle) { prepTitle = m.preparing; document.getElementById('prepText').textContent = 'Preparing ' + prepTitle + '…'; }
   else document.getElementById('prepBar').style.width = '0';
-  const src = m.cached ? '/cache/' + m.cached + '/master.m3u8' : (m.file ? url(m.file) : null);
+  const src = m.media ? m.media.src : null;
   const w = document.getElementById('wait');
-  w.hidden = !m.waiting;
-  if (m.waiting) waitText.textContent = '⏳ Waiting for ' + m.waiting + (m.waiting > 1 ? ' viewers' : ' viewer') + ' to buffer…';
+  w.hidden = !m.waiting.length;
+  if (m.waiting.length) waitText.textContent = 'Waiting for ' + m.waiting.join(', ') + ' to buffer…';
   if (src !== curSrc) { curSrc = src; resetBuffering(); load(src); }
-  if (m.file !== curFile) {
-    curFile = m.file;
+  const file = m.media ? vidOf[m.media.vid] : null;
+  if (file !== curFile) {
+    curFile = file;
     for (const d of lib.querySelectorAll('.file')) d.classList.toggle('cur', d.dataset.f === curFile);
     for (const d of lib.querySelectorAll('details')) if (d.querySelector('.cur')) d.open = true;
   }
@@ -208,7 +211,7 @@ setInterval(() => {
   else if (!last.playing && !ok) reportBuffering();
 }, 200);
 document.getElementById('force').onclick = () => send({type:'force'});
-loadLib(); // Mobile browsers block play() without a gesture; this button supplies one.
+// Mobile browsers block play() without a gesture; this button supplies one.
 tap.onclick = () => { tap.hidden = true; if (last.playing) { v.currentTime = expected(); v.play().catch(()=>{ tap.hidden = false; }); } };
 v.addEventListener('playing', () => { tap.hidden = true; });
 connect();
