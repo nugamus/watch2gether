@@ -100,6 +100,11 @@ impl Store {
         })
     }
 
+    /// The data folder.
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap()
+    }
+
     pub fn read<R>(&self, f: impl FnOnce(&Data) -> R) -> R {
         f(&self.data.lock().unwrap())
     }

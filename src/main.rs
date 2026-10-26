@@ -9,7 +9,7 @@ use axum::{
     Extension, Form, Json, Router,
     body::Body,
     extract::{
-        Path as UrlPath, Request, State, WebSocketUpgrade,
+        DefaultBodyLimit, Multipart, Path as UrlPath, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode, header},
@@ -327,6 +327,14 @@ enum In {
         path: String,
     },
     End,
+    /// Subtitle delay in seconds, for everyone.
+    Offset {
+        v: f64,
+    },
+    /// Remove a subtitle the host added.
+    Subremove {
+        id: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -515,6 +523,10 @@ fn router(app: Shared) -> Router {
         .route("/api/links", get(list_links).post(create_link))
         .route("/api/links/{id}", axum::routing::delete(revoke_link))
         .route("/api/links/{id}/regenerate", post(regenerate_link))
+        .route(
+            "/api/subs",
+            post(add_sub).layer(DefaultBodyLimit::max(subs::MAX_BYTES + 64 * 1024)),
+        )
         .route("/login", get(login_page).post(login_post))
         .route("/r/{token}", get(redeem))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -630,7 +642,38 @@ async fn handle(app: &Shared, id: u64, role: &Role, cmd: In) {
             r.reset(None);
             r.snapshot(id)
         }
-        In::Select { .. } | In::End => return,
+        In::Offset { v } if host => {
+            let v = (v.clamp(-600.0, 600.0) * 10.0).round() / 10.0;
+            let mut r = app.room.lock().unwrap();
+            let Some(c) = r.current.as_mut() else { return };
+            c.offset = v;
+            let vid = c.vid.clone();
+            app.store.update(|d| d.offsets.insert(vid, v));
+            r.snapshot(0)
+        }
+        In::Subremove { id } if host => {
+            let Some(vid) = app
+                .room
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .map(|c| c.vid.clone())
+            else {
+                return;
+            };
+            let removed = app.store.update(|d| {
+                let list = d.subs.entry(vid.clone()).or_default();
+                let before = list.len();
+                list.retain(|u| format!("u{}", u.id) != id);
+                before != list.len()
+            });
+            if removed {
+                let _ = std::fs::remove_file(app.upload_path(&vid, &id[1..]));
+            }
+            app.refresh_uploads()
+        }
+        In::Select { .. } | In::End | In::Offset { .. } | In::Subremove { .. } => return,
         In::Failed { msg } => {
             let name = app
                 .room
@@ -699,10 +742,58 @@ impl App {
         let _ = self.tx.send(serde_json::to_string(out).unwrap());
     }
 
+    fn upload_path(&self, vid: &str, id: &str) -> PathBuf {
+        self.store
+            .dir()
+            .join("subs")
+            .join(vid)
+            .join(format!("{id}.vtt"))
+    }
+
+    fn upload_tracks(&self, vid: &str) -> Vec<SubTrack> {
+        let list = self
+            .store
+            .read(|d| d.subs.get(vid).cloned().unwrap_or_default());
+        list.into_iter()
+            .map(|u| SubTrack {
+                path: self.upload_path(vid, &u.id),
+                id: format!("u{}", u.id),
+                name: u.name,
+                lang: u.lang,
+            })
+            .collect()
+    }
+
+    /// Re-read the host's added subtitles for the current video; returns the new state.
+    fn refresh_uploads(&self) -> String {
+        let mut r = self.room.lock().unwrap();
+        if let Some(c) = r.current.as_mut() {
+            c.subs.retain(|s| !s.id.starts_with('u'));
+            c.subs.extend(self.upload_tracks(&c.vid));
+        }
+        r.snapshot(0)
+    }
+
+    /// A sidecar subtitle converted to WebVTT, cached until the file changes.
+    async fn sidecar_vtt(&self, path: &Path) -> Result<PathBuf, String> {
+        let key = convert::cache_key(path, &path.to_string_lossy()).ok_or("unreadable")?;
+        let out = self.cache.join("subs").join(format!("{key}.vtt"));
+        if !out.exists() {
+            if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > subs::MAX_BYTES as u64 {
+                return Err("larger than 5 MB".into());
+            }
+            let vtt = subs::to_vtt(&std::fs::read(path).map_err(|e| e.to_string())?).await?;
+            std::fs::create_dir_all(out.parent().unwrap()).map_err(|e| e.to_string())?;
+            std::fs::write(&out, vtt).map_err(|e| e.to_string())?;
+        }
+        Ok(out)
+    }
+
     /// Make `rel` the room's video, paused at 0:00, and tell everyone.
     async fn activate(&self, rel: String, media: Media, meta: convert::Meta, origin: u64) {
         let vid = video_id(&rel);
         let mut subs = Vec::new();
+        let sidecars = subs::sidecars(&self.root.join(&rel));
         if let Media::Hls(dir) = &media {
             for (i, s) in meta.subs.iter().enumerate() {
                 subs.push(SubTrack {
@@ -713,6 +804,18 @@ impl App {
                 });
             }
         }
+        for (i, sc) in sidecars.into_iter().enumerate() {
+            match self.sidecar_vtt(&sc.path).await {
+                Ok(path) => subs.push(SubTrack {
+                    id: format!("x{i}"),
+                    name: sc.name,
+                    lang: sc.lang,
+                    path,
+                }),
+                Err(e) => eprintln!("skipping subtitle {}: {e}", sc.path.display()),
+            }
+        }
+        subs.extend(self.upload_tracks(&vid));
         let offset = self
             .store
             .read(|d| d.offsets.get(&vid).copied().unwrap_or(0.0));
@@ -892,6 +995,69 @@ async fn list_files(State(app): State<Shared>) -> Json<Vec<FileOut>> {
             })
             .collect(),
     )
+}
+
+/// Host adds a subtitle to the current video, from an uploaded file or a URL. It is converted to
+/// WebVTT and kept in the data folder, so it is there again next time the video is played.
+async fn add_sub(State(app): State<Shared>, mut form: Multipart) -> Response {
+    let bad = |m: String| (StatusCode::BAD_REQUEST, m).into_response();
+    let (mut file, mut url) = (None, None);
+    while let Ok(Some(field)) = form.next_field().await {
+        match field.name() {
+            Some("file") => {
+                let name = field.file_name().unwrap_or("").to_string();
+                match field.bytes().await {
+                    Ok(b) if !b.is_empty() => file = Some((name, b.to_vec())),
+                    Ok(_) => {}
+                    Err(_) => return bad("The file is larger than 5 MB".into()),
+                }
+            }
+            Some("url") => url = field.text().await.ok().filter(|u| !u.trim().is_empty()),
+            _ => {}
+        }
+    }
+    let (source, bytes) = match (file, url) {
+        (Some(f), _) => f,
+        (None, Some(u)) => match subs::fetch(&u).await {
+            Ok(b) => (u.rsplit('/').next().unwrap_or("").to_string(), b),
+            Err(e) => return bad(format!("Could not download it: {e}")),
+        },
+        (None, None) => return bad("Choose a file or paste a link".into()),
+    };
+    let vtt = match subs::to_vtt(&bytes).await {
+        Ok(v) => v,
+        Err(e) => return bad(format!("Could not use it: {e}")),
+    };
+    let Some(vid) = app
+        .room
+        .lock()
+        .unwrap()
+        .current
+        .as_ref()
+        .map(|c| c.vid.clone())
+    else {
+        return (StatusCode::CONFLICT, "Start a video first").into_response();
+    };
+    let (lang, name) = subs::upload_label(&source, &vtt);
+    let id = store::random_token(6);
+    let path = app.upload_path(&vid, &id);
+    if let Err(e) =
+        std::fs::create_dir_all(path.parent().unwrap()).and_then(|_| std::fs::write(&path, vtt))
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not save it: {e}"),
+        )
+            .into_response();
+    }
+    app.store.update(|d| {
+        d.subs
+            .entry(vid)
+            .or_default()
+            .push(store::Upload { id, name, lang })
+    });
+    let _ = app.tx.send(app.refresh_uploads());
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Serialize)]
@@ -1351,6 +1517,97 @@ mod tests {
         assert_eq!(
             get(&t.app, "/", Some(&guest)).await.headers()[header::LOCATION],
             "/login?e=2"
+        );
+    }
+
+    fn upload(cookie: &str, filename: &str, bytes: &[u8]) -> HttpRequest<Body> {
+        let head = format!(
+            "--XX\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\r\n"
+        );
+        let mut b = head.into_bytes();
+        b.extend_from_slice(bytes);
+        b.extend_from_slice(b"\r\n--XX--\r\n");
+        HttpRequest::post("/api/subs")
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=XX")
+            .body(Body::from(b))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn host_uploads_gbk_subtitles_guest_cannot() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return eprintln!("ffmpeg not installed; skipping");
+        }
+        let t = setup();
+        let (guest, _, _) = guest_cookie(&t.app).await;
+        let root = t.app.root.clone();
+        t.app
+            .activate(
+                "a.mp4".into(),
+                Media::Direct(root.join("a.mp4")),
+                Default::default(),
+                0,
+            )
+            .await;
+        let srt = "1
+00:00:01,000 --> 00:00:04,000
+你好，这是中文字幕。我们一起看电影吧。
+";
+        let (gbk, _, _) = encoding_rs::GBK.encode(srt);
+
+        let res = router(t.app.clone())
+            .oneshot(upload(&guest, "x.srt", &gbk))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let res = router(t.app.clone())
+            .oneshot(upload(&host_cookie(&t.app), "movie.srt", &gbk))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT, "{}", body(res).await);
+        let (nonce, sub) = {
+            let r = t.app.room.lock().unwrap();
+            let c = r.current.as_ref().unwrap();
+            (
+                c.nonce.clone(),
+                c.subs
+                    .iter()
+                    .map(|s| (s.id.clone(), s.name.clone()))
+                    .next()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(sub.1, "Chinese", "language guessed from the text");
+        let vtt = body(get(&t.app, &format!("/m/{nonce}/sub/{}", sub.0), Some(&guest)).await).await;
+        assert!(vtt.contains("你好，这是中文字幕。"), "{vtt}");
+
+        // Kept with the video for next time.
+        t.app.room.lock().unwrap().reset(None);
+        t.app
+            .activate(
+                "a.mp4".into(),
+                Media::Direct(root.join("a.mp4")),
+                Default::default(),
+                0,
+            )
+            .await;
+        assert_eq!(
+            t.app
+                .room
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .subs
+                .len(),
+            1
         );
     }
 
