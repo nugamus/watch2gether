@@ -35,6 +35,7 @@
   #newLink input[name=name]{flex:1}#newLink input[name=days]{width:56px}
   #newLink button,.btn{color:#ccc;border:1px solid #2a2a2a;padding:4px 9px;border-radius:2px}
   #newLink button:hover,.btn:hover{color:#fff;border-color:#444}
+  #build{color:#555;margin-left:4px}
   #modes{display:flex;flex-direction:column;gap:5px;padding:7px 10px;color:#aaa}
   #modes label{cursor:pointer}#modes input{min-width:0;margin:0 7px 0 0;vertical-align:-2px}
 
@@ -113,7 +114,7 @@
 <body class="ui">
 <div id="app">
   <aside id="lib" hidden>
-    <div class="hd"><span>Library</span><button id="endBtn" type="button">End session</button><button id="libClose" type="button">Close</button></div>
+    <div class="hd"><span>Library <small id="build" title="Build running on the server"></small></span><button id="endBtn" type="button">End session</button><button id="libClose" type="button">Close</button></div>
     <div id="tree" class="scroll"></div>
     <div class="hd"><span>Slow connections</span></div>
     <div id="modes">
@@ -224,6 +225,7 @@ function connect() {
 
 function welcome(m) {
   isHost = m.host;
+  $('build').textContent = m.build ? 'build ' + m.build : '';
   $('libBtn').hidden = !isHost;
   $('msgs').textContent = '';
   for (const c of m.chat) addMsg(c, true);
@@ -315,18 +317,18 @@ function isReady() {
 }
 function resetBuffering() { clearTimeout(bufTimer); reported = false; }
 function reportReady() { if (!reported) return; resetBuffering(); send({type:'ready', t:v.currentTime, seq:lastSeq}); }
-function reportBuffering() {
+function reportBuffering(why) {
   if (reported) return;
   const now = performance.now();
   needSecs = now - lastStall < 30000 ? Math.min(needSecs * 2, mode.slow ? 60 : 30) : (mode.slow ? 10 : 3);
   lastStall = now;
   reported = true;
-  send({type:'buffering'});
+  send({type: 'buffering', why: why + ' rs=' + v.readyState + ' ahead=' + aheadSecs().toFixed(1) + 's need=' + needSecs + 's' + (v.paused ? ' paused' : '') + (document.hidden ? ' hidden' : '') + (needTap ? ' needs-tap' : '')});
 }
 v.addEventListener('waiting', () => {
   if (!last.playing || reported) return;
   clearTimeout(bufTimer);
-  bufTimer = setTimeout(() => { if (v.readyState < 3) reportBuffering(); }, 700);
+  bufTimer = setTimeout(() => { if (v.readyState < 3) reportBuffering('stalled'); }, 700);
 });
 for (const e of ['playing', 'canplay']) v.addEventListener(e, () => clearTimeout(bufTimer));
 setInterval(() => {
@@ -334,7 +336,7 @@ setInterval(() => {
   if (!curSrc) { reportReady(); return; } // nothing to load, so nothing to wait for
   const ok = isReady();
   if (reported) { if (ok) reportReady(); }
-  else if (!last.playing && !ok) reportBuffering();
+  else if (!last.playing && !ok) reportBuffering('not enough buffered');
 }, 200);
 // Mobile browsers block play() without a gesture; the "Tap to join" button supplies one.
 let needTap = false;
