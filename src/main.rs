@@ -149,7 +149,17 @@ impl Current {
                 .iter()
                 .map(|s| SubOut {
                     id: s.id.clone(),
-                    name: s.name.clone(),
+                    // Same name twice (an embedded "English" and an English .srt): say where each is from.
+                    name: if self.subs.iter().filter(|o| o.name == s.name).count() > 1 {
+                        let from = match s.id.as_bytes()[0] {
+                            b'e' => "embedded",
+                            b'x' => "file",
+                            _ => "added",
+                        };
+                        format!("{} ({from})", s.name)
+                    } else {
+                        s.name.clone()
+                    },
                     lang: s.lang.clone(),
                     src: format!("{base}sub/{}", s.id),
                 })
@@ -171,6 +181,10 @@ struct Room {
     clients: HashSet<u64>,
     /// Display names viewers chose.
     names: HashMap<u64, String>,
+    /// Last 50 chat messages (not persisted).
+    chat: std::collections::VecDeque<ChatMsg>,
+    /// When each viewer last reacted, to limit reactions to one a second.
+    reacted: HashMap<u64, Instant>,
     /// Viewers who have not confirmed they are ready (stalled, still loading, or just seeked).
     buffering: HashSet<u64>,
     /// Playback was paused because of `buffering` and should resume once it clears.
@@ -190,6 +204,8 @@ impl Room {
             at: Instant::now(),
             clients: HashSet::new(),
             names: HashMap::new(),
+            chat: Default::default(),
+            reacted: HashMap::new(),
             buffering: HashSet::new(),
             resume: false,
             seq: 0,
@@ -322,6 +338,12 @@ enum In {
     Hello {
         name: String,
     },
+    Chat {
+        text: String,
+    },
+    React {
+        r: String,
+    },
     // Host only:
     Select {
         path: String,
@@ -381,8 +403,24 @@ enum Out {
     },
     Welcome {
         host: bool,
+        /// Recent chat, so a (re)joining viewer sees the conversation.
+        chat: Vec<ChatMsg>,
+    },
+    Chat(ChatMsg),
+    React {
+        name: String,
+        r: String,
     },
 }
+
+#[derive(Serialize, Clone)]
+struct ChatMsg {
+    name: String,
+    text: String,
+}
+
+/// The reactions viewers can send.
+const REACTIONS: [&str; 6] = ["♥", "ha", "wow", "!", "?", "zzz"];
 
 struct App {
     auth: Option<Auth>,
@@ -556,16 +594,17 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
     let (mut sink, mut stream) = socket.split();
 
     // A newcomer counts as not ready until they confirm, so a playing room pauses for them.
-    let first = {
+    let (first, chat) = {
         let mut r = app.room.lock().unwrap();
         r.clients.insert(id);
         if r.current.is_some() {
             r.buffering(id);
         }
-        r.snapshot(0)
+        (r.snapshot(0), r.chat.iter().cloned().collect())
     };
     let welcome = serde_json::to_string(&Out::Welcome {
         host: role == Role::Host,
+        chat,
     })
     .unwrap();
     let _ = sink.send(Message::text(welcome)).await;
@@ -616,6 +655,7 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
         let mut r = app.room.lock().unwrap();
         r.clients.remove(&id);
         r.names.remove(&id);
+        r.reacted.remove(&id);
         r.buffering.remove(&id).then(|| {
             r.try_resume();
             r.snapshot(0)
@@ -688,6 +728,42 @@ async fn handle(app: &Shared, id: u64, role: &Role, cmd: In) {
                 msg: format!("{name} cannot play this video: {msg}"),
             });
             return;
+        }
+        In::Chat { text } => {
+            let text: String = text
+                .trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(500)
+                .collect();
+            let mut r = app.room.lock().unwrap();
+            let Some(name) = r.names.get(&id).cloned() else {
+                return;
+            };
+            if text.is_empty() {
+                return;
+            }
+            let msg = ChatMsg { name, text };
+            if r.chat.len() == 50 {
+                r.chat.pop_front();
+            }
+            r.chat.push_back(msg.clone());
+            serde_json::to_string(&Out::Chat(msg)).unwrap()
+        }
+        In::React { r: reaction } => {
+            let mut r = app.room.lock().unwrap();
+            let Some(name) = r.names.get(&id).cloned() else {
+                return;
+            };
+            let recent = r
+                .reacted
+                .get(&id)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(1));
+            if recent || !REACTIONS.contains(&reaction.as_str()) {
+                return;
+            }
+            r.reacted.insert(id, Instant::now());
+            serde_json::to_string(&Out::React { name, r: reaction }).unwrap()
         }
         In::Hello { name } => {
             let name: String = name
