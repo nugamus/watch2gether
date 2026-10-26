@@ -1,20 +1,21 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>watch2gether</title>
 <style>
-  html,body{margin:0;height:100%;background:#0b0b0e;color:#ddd;font:16px system-ui,sans-serif}
+  html,body{margin:0;height:100%;background:#000;color:#ddd;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
   body{display:flex;align-items:center;justify-content:center}
-  form{display:flex;flex-direction:column;gap:12px;width:min(320px,86vw)}
-  input,button{font:inherit;padding:10px 12px;border-radius:6px;border:1px solid #333;background:#16161d;color:#ddd}
-  button{background:#2a2a40;cursor:pointer}
-  #err{color:#e66;min-height:1.2em;margin:0}
+  form{display:flex;gap:6px;width:min(300px,86vw);flex-wrap:wrap}
+  input,button{font:inherit;padding:6px 9px;border-radius:2px;border:1px solid #2a2a2a;background:#0a0a0a;color:#ddd;outline:none}
+  input{flex:1;min-width:0}input:focus{border-color:#555}
+  button{cursor:pointer;color:#ccc}button:hover{color:#fff;border-color:#444}
+  @media (pointer:coarse){input,button{font-size:16px}}
+  #err{flex-basis:100%;color:#999;min-height:1.4em;margin:0}
 </style></head>
 <body>
 <form method="post" action="/login">
-  <h2 style="margin:0">watch2gether</h2>
-  <input type="password" name="password" placeholder="Password" autocomplete="current-password" autofocus required>
-  <p id="err"></p>
+  <input type="password" name="password" placeholder="Password" autocomplete="current-password" aria-label="Password" autofocus required>
   <button type="submit">Enter</button>
+  <p id="err"></p>
 </form>
-<script>if (new URLSearchParams(location.search).has('e')) document.getElementById('err').textContent = 'Wrong password';</script>
+<script>const e = new URLSearchParams(location.search).get('e'); if (e) document.getElementById('err').textContent = e === '2' ? 'This link no longer works. Ask the host for a new one.' : 'Wrong password';</script>
 </body></html>
