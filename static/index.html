@@ -198,13 +198,12 @@ const fmt = s => {
 let localSeekAt = -1e9, remoteSeekT = null, lastSeq = -1;
 let ws, last = {playing:false, t:0, at:performance.now()}, curSrc = null;
 let isHost = false, media = null, room = null, connected = false, pct = null;
-let name = store.get('name', '');
 const expected = () => last.playing ? last.t + (performance.now()-last.at)/1000 : last.t;
 const send = o => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
 
 function connect() {
   ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws');
-  ws.onopen = () => { resetBuffering(); lastSeq = -1; connected = true; if (name) send({type:'hello', name}); status(); };
+  ws.onopen = () => { resetBuffering(); lastSeq = -1; connected = true; status(); };
   ws.onclose = () => {
     connected = false; status();
     // Revoked or expired link: the page itself now redirects to the login page with a note.
@@ -316,7 +315,7 @@ function isReady() {
   return v.readyState >= 2 && (ahead >= need || (!mode.slow && v.readyState >= 4));
 }
 function resetBuffering() { clearTimeout(bufTimer); reported = false; }
-function reportReady() { if (!reported) return; resetBuffering(); send({type:'ready', t:v.currentTime, seq:lastSeq}); }
+function reportReady(t = v.currentTime) { if (!reported) return; resetBuffering(); send({type:'ready', t, seq:lastSeq}); }
 function reportBuffering(why) {
   if (reported) return;
   const now = performance.now();
@@ -326,7 +325,7 @@ function reportBuffering(why) {
   send({type: 'buffering', why: why + ' rs=' + v.readyState + ' ahead=' + aheadSecs().toFixed(1) + 's need=' + needSecs + 's' + (v.paused ? ' paused' : '') + (document.hidden ? ' hidden' : '') + (needTap ? ' needs-tap' : '')});
 }
 v.addEventListener('waiting', () => {
-  if (!last.playing || reported) return;
+  if (!last.playing || reported || document.hidden) return;
   clearTimeout(bufTimer);
   bufTimer = setTimeout(() => { if (v.readyState < 3) reportBuffering('stalled'); }, 700);
 });
@@ -334,6 +333,9 @@ for (const e of ['playing', 'canplay']) v.addEventListener(e, () => clearTimeout
 setInterval(() => {
   if (!ws || ws.readyState !== 1) return;
   if (!curSrc) { reportReady(); return; } // nothing to load, so nothing to wait for
+  // A background tab (switched away, phone locked) isn't watching: never hold the room for it, and
+  // confirm at the room's position, not its own stale one (that would pull everyone back).
+  if (document.hidden) { if (reported) reportReady(expected()); return; }
   const ok = isReady();
   if (reported) { if (ok) reportReady(); }
   else if (!last.playing && !ok) reportBuffering('not enough buffered');
@@ -372,13 +374,6 @@ function status() {
     $('force').onclick = () => send({type:'force'});
   } else st.textContent = '';
   const c = [];
-  if (!name) {
-    if ($('nameIn')) return;
-    center.innerHTML = '<label for="nameIn">Your name</label><input id="nameIn" maxlength="24" autocomplete="nickname" enterkeyhint="done">';
-    const i = $('nameIn'); i.focus();
-    i.onkeydown = e => { if (e.key === 'Enter' && i.value.trim()) { name = i.value.trim(); store.set('name', name); send({type:'hello', name}); status(); } };
-    return;
-  }
   if (room && room.preparing) c.push('Preparing ' + esc(room.preparing) + (pct !== null ? ' ' + pct + '%' : '…'));
   else if (room && !room.media) c.push(isHost ? 'Nothing playing' : 'Waiting for the host');
   if (needTap) c.push('<button id="tap" type="button">Tap to join</button>');
