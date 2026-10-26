@@ -254,30 +254,35 @@ pub fn load_meta(dir: &Path) -> Option<Meta> {
 }
 
 /// Build the HLS folder `dir` for `src`, reporting percent done. Falls back to libx264 if the GPU
-/// encoder fails on this particular file.
+/// encoder fails on this particular file. `lite` makes a second, video-only copy at 720p and
+/// `LITE_RATE` for viewers whose connection can't keep up; it plays with the original's audio.
 pub async fn run(
     src: &Path,
     dir: &Path,
     enc: Encoder,
+    lite: bool,
     progress: impl Fn(u8),
 ) -> Result<Meta, String> {
     let p = probe(src).await?;
-    match build(src, dir, &p, enc, &progress).await {
+    match build(src, dir, &p, enc, lite, &progress).await {
         Err(e) if enc == Encoder::Vaapi => {
             eprintln!("VAAPI encode failed, retrying with libx264: {e}");
-            build(src, dir, &p, Encoder::X264, &progress).await
+            build(src, dir, &p, Encoder::X264, lite, &progress).await
         }
         r => r,
     }
 }
 
-/// Output size for a transcode: same aspect, at most 1080 lines, even dimensions.
-fn fit_1080(v: &Stream) -> (u32, u32) {
+/// Lite video bitrate (bit/s): 720p H.264 that a ~2 Mbit/s connection can stream.
+pub const LITE_RATE: u64 = 1_200_000;
+
+/// Output size for a transcode: same aspect, at most `max_h` lines, even dimensions.
+fn fit(v: &Stream, max_h: u32) -> (u32, u32) {
     let (w, h) = (v.width.unwrap_or(1920), v.height.unwrap_or(1080));
-    if h <= 1080 {
+    if h <= max_h {
         return (w & !1, h & !1);
     }
-    (((w as u64 * 1080 / h as u64) as u32) & !1, 1080)
+    (((w as u64 * max_h as u64 / h as u64) as u32) & !1, max_h)
 }
 
 /// Transcode bitrate (bit/s): H.264 needs roughly 1.5x what HEVC does for the same quality.
@@ -307,19 +312,25 @@ async fn build(
     dir: &Path,
     p: &Probe,
     enc: Encoder,
+    lite: bool,
     progress: &impl Fn(u8),
 ) -> Result<Meta, String> {
     let v = p.video().ok_or("no video stream found")?;
+    let max_h = if lite { 720 } else { 1080 };
     let tmp = dir.with_extension("part");
     let _ = std::fs::remove_dir_all(&tmp);
-    let audio: Vec<&Stream> = p.of("audio").collect();
+    let audio: Vec<&Stream> = if lite {
+        vec![]
+    } else {
+        p.of("audio").collect()
+    };
     for d in std::iter::once("v".to_string()).chain((0..audio.len()).map(|i| format!("a{i}"))) {
         std::fs::create_dir_all(tmp.join(d)).map_err(|e| format!("cannot write to cache: {e}"))?;
     }
 
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-nostdin", "-y", "-v", "error", "-progress", "pipe:1"]);
-    let transcode = !is_plain_h264(v);
+    let transcode = lite || !is_plain_h264(v);
     if transcode && enc == Encoder::Vaapi {
         cmd.args([
             "-hwaccel",
@@ -334,8 +345,8 @@ async fn build(
 
     cmd.args(["-map", &format!("0:{}", v.index)]);
     if transcode {
-        let (w, h) = fit_1080(v);
-        let rate = target_rate(p, v);
+        let (w, h) = fit(v, max_h);
+        let rate = if lite { LITE_RATE } else { target_rate(p, v) };
         let (b, max, buf) = (
             rate.to_string(),
             (rate * 3 / 2).to_string(),
@@ -373,16 +384,17 @@ async fn build(
 
     for (i, a) in audio.iter().enumerate() {
         cmd.args(["-map", &format!("0:{}", a.index)]);
-        if is_plain_aac(a) {
+        if is_plain_aac(a) && !lite {
             cmd.args(["-c:a", "copy"]);
         } else {
-            cmd.args(["-c:a", "aac", "-ac", "2", "-b:a", "160k"]);
+            let rate = if lite { "128k" } else { "160k" };
+            cmd.args(["-c:a", "aac", "-ac", "2", "-b:a", rate]);
         }
         hls_out(&mut cmd, &tmp.join(format!("a{i}")));
     }
 
     let mut meta = Meta::default();
-    for (i, s) in p.of("subtitle").enumerate() {
+    for (i, s) in p.of("subtitle").enumerate().filter(|_| !lite) {
         let name = s.name(format!("Subtitle {}", i + 1));
         if !is_text_sub(s) {
             meta.skipped.push(format!("{name} ({})", s.codec_name));
@@ -409,7 +421,7 @@ async fn build(
 
     // What the browser will receive: the source stream if copied, else High@4.1 at the new size.
     let out = if transcode {
-        let (w, h) = fit_1080(v);
+        let (w, h) = fit(v, max_h);
         Stream {
             width: Some(w),
             height: Some(h),
@@ -479,6 +491,23 @@ async fn run_ffmpeg(mut cmd: Command, duration: f64, progress: &impl Fn(u8)) -> 
         return Err(format!("ffmpeg failed: {}", err.trim()));
     }
     Ok(())
+}
+
+/// The original's master playlist plus the lite copy (served under `lite/`) as a second variant
+/// sharing the original's audio, so each player can pick or switch between them.
+pub fn combined_master(orig: &str, lite: &str) -> String {
+    let Some(inf) = lite.lines().find(|l| l.starts_with("#EXT-X-STREAM-INF:")) else {
+        return orig.to_string();
+    };
+    let mut inf = inf.to_string();
+    if orig.contains("GROUP-ID=\"aud\"") {
+        if let Some(i) = inf.find("CODECS=\"") {
+            let end = inf[i + 8..].find('"').map_or(inf.len(), |e| i + 8 + e);
+            inf.insert_str(end, ",mp4a.40.2");
+        }
+        inf += ",AUDIO=\"aud\"";
+    }
+    format!("{}\n{inf}\nlite/v/index.m3u8\n", orig.trim_end())
 }
 
 /// RFC 6381 codec string for an H.264 stream, e.g. `avc1.640028`.
@@ -582,6 +611,60 @@ mod tests {
         assert!(direct_play("m.webm", &probe_json(webm)));
     }
 
+    #[tokio::test]
+    async fn lite_copy_is_720p_h264() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return eprintln!("ffmpeg not installed; skipping");
+        }
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("in.mkv");
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=1920x1080:d=2",
+                "-f",
+                "lavfi",
+            ])
+            .args(["-i", "sine=d=2", "-c:v", "libx264", "-c:a", "aac"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let out = d.path().join("lite");
+        run(&src, &out, Encoder::X264, true, |_| {}).await.unwrap();
+        let p = probe(&out.join("v/init.mp4")).await.unwrap();
+        assert_eq!(p.video().unwrap().height, Some(720));
+        assert!(
+            p.of("audio").next().is_none(),
+            "lite plays with the original's audio"
+        );
+        assert!(
+            std::fs::read_to_string(out.join("master.m3u8"))
+                .unwrap()
+                .contains("1280x720")
+        );
+    }
+
+    #[test]
+    fn lite_joins_the_master_playlist() {
+        let orig = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",URI=\"a0/index.m3u8\"\n\
+                    #EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS=\"avc1.640028,mp4a.40.2\",RESOLUTION=1920x800,AUDIO=\"aud\"\nv/index.m3u8\n";
+        let lite = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,CODECS=\"avc1.640029\",RESOLUTION=1280x534\nv/index.m3u8\n";
+        let m = combined_master(orig, lite);
+        assert!(m.starts_with(orig.trim_end()));
+        assert!(m.ends_with(
+            "BANDWIDTH=1400000,CODECS=\"avc1.640029,mp4a.40.2\",RESOLUTION=1280x534,AUDIO=\"aud\"\nlite/v/index.m3u8\n"
+        ));
+    }
+
     #[test]
     fn transcode_sizes() {
         let s = |w, h| Stream {
@@ -589,8 +672,9 @@ mod tests {
             height: Some(h),
             ..Default::default()
         };
-        assert_eq!(fit_1080(&s(3840, 2160)), (1920, 1080));
-        assert_eq!(fit_1080(&s(1920, 800)), (1920, 800));
-        assert_eq!(fit_1080(&s(3840, 1600)), (2592, 1080));
+        assert_eq!(fit(&s(3840, 2160), 1080), (1920, 1080));
+        assert_eq!(fit(&s(1920, 800), 1080), (1920, 800));
+        assert_eq!(fit(&s(3840, 1600), 1080), (2592, 1080));
+        assert_eq!(fit(&s(1920, 872), 720), (1584, 720));
     }
 }
