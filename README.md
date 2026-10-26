@@ -1,38 +1,104 @@
-# watch2gether
+# watch2gether (movie-night fork)
 
-Watch videos from your own computer together with friends over the internet, in perfect sync.
+Watch videos from your own server together with a friend over the internet, in strict sync, with proper subtitles and a password-free link for your guest.
 
-watch2gether is a single Rust binary. Point it at a folder of videos, open the link in a browser, and everyone in the room sees the same frame at the same time. Play, pause and seek apply to everyone, and if one viewer's connection can't keep up, the whole room waits for them.
+This is a fork of [stasnocap/watch2gether](https://github.com/stasnocap/watch2gether) by stasnocap, which provides the single-binary design and the strict-sync engine. This fork adds HLS preparation for MKV/HEVC files, subtitles, per-viewer audio tracks, host/guest roles with share links, chat, and a Docker image for home servers. MIT licensed, like upstream.
 
-No uploads, no third-party service, nothing to install for viewers: they just open a web page.
+It is still one small Rust binary ([axum](https://github.com/tokio-rs/axum) + [tokio](https://tokio.rs)) with the web page compiled in, ffmpeg for media work, and a JSON file for state. There is no database server.
 
 ## Features
 
-- **Strict sync.** Play, pause, seek and ±10s skips apply to everyone. If one viewer stalls or is still loading, the room freezes until they're ready, then resumes for all from the same position.
-- **Your files, streamed directly.** Videos are served straight from disk with HTTP range requests, so seeking is instant and nothing is re-encoded.
-- **Plays `.mkv` on iPhone.** Safari can't play Matroska, so `.mkv` files are converted to MP4 once on first play, after a confirmation prompt (video copied, audio turned into AAC) and cached. Later plays start instantly.
-- **Folder library.** Browse your video folder as a collapsible tree in the page, and pick what to watch together.
-- **Password protected.** Viewers log in with a shared password. Sessions last 30 days, and guessing is rate-limited.
-- **Works on phones.** Responsive layout with a collapsible library, inline playback on iPhone, and a tap-to-join prompt where the browser blocks autoplay.
-- **Small and fast.** One binary with the web page compiled in, built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs).
+- **Strict sync.** Play, pause and seek apply to everyone. If one viewer stalls or is still loading, the room waits for them ("Waiting for Lin to buffer…"), then resumes for all from the same position. On a slow link the buffer required before resuming grows, so the room pauses less often but for longer.
+- **Plays MKV, HEVC and multi-audio files everywhere.** Files browsers can already play (H.264 MP4 with one AAC track, VP9/AV1 WebM) are streamed as-is. Everything else is prepared once, in the background, into an HLS folder in the cache, with a progress indicator for everyone:
+  - 8-bit H.264 video is copied, so quality is untouched and preparing a 2 GB movie takes about a minute.
+  - HEVC and 10-bit video are transcoded to H.264 (at most 1080p). This uses Intel Quick Sync (VAAPI) when `/dev/dri` is available, otherwise libx264.
+  - Every audio track is kept (as AAC stereo), and text subtitles are extracted.
+- **Subtitles.**
+  - Sources: embedded tracks; files next to the video (`Movie.srt`, `Movie.zh.srt`, `Movie.en.vtt`, `Movie.ass`…); files the host uploads or links to during a session. Added files are stored with the video and are there again next time.
+  - Chinese files in GBK/GB18030 or Big5 (and UTF-16) are detected and converted, so they never show as garbage. SRT/ASS/SSA are converted to WebVTT.
+  - Each viewer picks their own track and can show a **second track on top** (e.g. Chinese at the bottom, English on top). Size and outline/box style are per viewer.
+  - The host sets the **subtitle delay** for everyone (±0.1 s / ±1 s, or `z`/`x`).
+- **Audio tracks per viewer**, in Firefox, Chrome and Safari (iPad/iPhone included).
+- **Host and guests.**
+  - The host logs in with the password and is the only one who sees the library, picks videos, adds subtitles, and manages share links.
+  - Guests join through a link with no password. They can play, pause, seek, chat and pick their own tracks, and see nothing else (see below).
+- **Chat and reactions.** A small side panel, and six text reactions that float over the video for a moment.
+- **mpv-style player.** The video is the whole page, with a thin bar that fades out and the usual mpv keys.
 
-## Requirements
+## Sharing with a guest
 
-- [Rust](https://rustup.rs) (edition 2024, so a recent toolchain)
-- [ffmpeg](https://ffmpeg.org) with `ffprobe` on your `PATH`, only needed to play `.mkv` files
-- A way for your friends to reach your computer: port forwarding, a tunnel such as Cloudflare Tunnel or Tailscale Funnel, or a reverse proxy. Use HTTPS in front of it, because the password is sent in plain text otherwise.
+1. Log in as host and open the library (the list icon). Under **Share links**, enter a name ("Lin") and optionally a number of days until it expires, then press **Create**.
+2. Copy the link (`https://your.host/r/<long-random-token>`) and send it. It is shown **only once**, because only a hash of it is stored. If it gets lost, press **New link**.
+3. Your guest opens it. The token is swapped for a session cookie and the address bar changes to the plain site address. No password is typed. The same link keeps working for future movie nights, and so does the cookie (30 days). Both survive restarts.
+4. Pick a video to start a session; guests who are waiting join automatically. **End session** sends everyone back to "Waiting for the host", and the link stays valid.
+5. **New link** replaces the token (the old link and its sessions stop working). **Revoke** deletes the link and disconnects its guests within seconds.
 
-## Quick start
+What guests can't do is enforced by the server, not just hidden in the page:
 
-```sh
-git clone https://github.com/stasnocap/watch2gether.git
-cd watch2gether
-W2G_PASSWORD='choose-a-password' cargo run --release -- ~/Videos --port 8080
+- `/api/*` (library, links, subtitle uploads) answers 403 to guests.
+- Video files are only served under `/m/<nonce>/…`, where the nonce changes with every video, and only resolve to the current video's files. Old URLs, other files and `../` give 404.
+- Guests only ever see the video's title, never its path. Host-only WebSocket commands from a guest are ignored.
+- Tokens are 256-bit random values compared in constant time. Cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` behind HTTPS.
+
+## Keyboard
+
+| Key | Action |
+|---|---|
+| `space` | play / pause |
+| `←` / `→` | seek 5 s |
+| `↑` / `↓` | volume |
+| `f` | fullscreen |
+| `m` | mute |
+| `j` | cycle subtitle track |
+| `v` | show / hide subtitles |
+| `#` | cycle audio track |
+| `z` / `x` | subtitle delay −0.1 s / +0.1 s (host) |
+
+## Running on ZimaOS / CasaOS (Docker)
+
+A prebuilt image is published to GitHub Container Registry on every push to `master`: `ghcr.io/nugamus/watch2gether:latest`, plus a `sha-<commit>` tag.
+
+In ZimaOS, add a custom app from this compose file (App Store → Custom Install → Import):
+
+```yaml
+name: watch2gether
+services:
+  watch2gether:
+    image: ghcr.io/nugamus/watch2gether:latest
+    restart: unless-stopped
+    ports:
+      - "8096:8080"
+    environment:
+      W2G_PASSWORD: change-me
+    volumes:
+      - /DATA/Media/Movies:/videos:ro
+      - /DATA/AppData/watch2gether/cache:/cache
+      - /DATA/AppData/watch2gether/data:/data
+    devices:
+      - /dev/dri:/dev/dri
+x-casaos:
+  hostname: stream.nugamus.quest
+  scheme: https
+  port_map: "443"
 ```
 
-Open `http://localhost:8080`, enter the password, pick a video, and send the link (and password) to your friends.
+- `/videos` is your library (read-only is fine). `/cache` holds prepared HLS copies, about the size of the original for copied video and smaller for transcodes. It is never cleaned automatically; delete folders in it to free space. `/data` holds `state.json` (links, sessions, subtitle delays) and added subtitles. Back it up if you care about your links.
+- `devices: /dev/dri` is optional. With it, HEVC transcodes run on the Intel GPU; the log then says `video encoder for transcodes: Vaapi`. Without it, or if the GPU test fails, transcodes use libx264 and the log says `X264`. Remove the two `devices` lines if your machine has no `/dev/dri`.
+- The container runs as root so it can write to folders ZimaOS creates as root and open `/dev/dri`. To run as a normal user instead, add `user: "1000:1000"` and `group_add: ["<gid of /dev/dri/renderD128>"]` (`stat -c %g /dev/dri/renderD128`), and make the cache and data folders writable by that user.
 
-## Usage
+**Reverse proxy (Nginx Proxy Manager):** create a proxy host for `stream.nugamus.quest` pointing to `http://<server-ip>:8096`, enable **Websockets Support**, and request an SSL certificate with Force SSL. NPM sends `X-Forwarded-Proto: https`, which makes cookies `Secure`.
+
+**Making the image public:** GHCR packages start out private, so ZimaOS can't pull them without credentials. After the first workflow run, go to your GitHub profile → **Packages** → **watch2gether** → **Package settings** → **Change visibility** → **Public**. Alternatively, keep it private and log in on the server with `docker login ghcr.io` using a personal access token with `read:packages`.
+
+**Updating:** pull the image again in ZimaOS (or `docker compose pull && docker compose up -d`).
+
+## Running without Docker
+
+Requirements: [Rust](https://rustup.rs) (edition 2024), and [ffmpeg](https://ffmpeg.org) with `ffprobe` on your `PATH`.
+
+```sh
+W2G_PASSWORD='choose-a-password' cargo run --release -- ~/Videos --port 8080
+```
 
 ```
 watch2gether [OPTIONS] [DIR]
@@ -43,71 +109,57 @@ watch2gether [OPTIONS] [DIR]
 | `DIR` | `.` | Folder of videos to share (searched recursively) |
 | `--port <PORT>` | `8080` | Port to listen on |
 | `--bind <ADDR>` | `0.0.0.0` | Address to listen on |
-| `--password <PW>` / `W2G_PASSWORD` | | Password viewers must enter. Prefer the environment variable, so the password doesn't show up in the process list |
-| `--cache-dir <DIR>` | `~/.cache/watch2gether` | Where converted `.mkv` → `.mp4` copies are stored |
-| `--allow-delete` | | Show a 🗑 button next to each library file that permanently deletes it from disk, after a confirmation prompt. Any viewer can use it, so only enable it for people you trust |
-| `--delete-source` | | After converting an `.mkv`, save the MP4 next to it in the library and delete the original. The MP4 is checked first (has video, has audio if the original did, same duration), and the original is kept if the check fails. The folder must be writable |
-| `--no-auth` | | Turn off the password check. Anyone who can reach the port can join |
+| `--password <PW>` / `W2G_PASSWORD` | | Host password. Prefer the environment variable so it stays out of the process list |
+| `--cache-dir <DIR>` | `~/.cache/watch2gether` | Prepared HLS copies and converted subtitles |
+| `--data-dir <DIR>` | `~/.local/share/watch2gether` | Share links, sessions, subtitle delays and added subtitles |
+| `--no-auth` | | Everyone who can reach the port is a host |
 
-The server refuses to start without a password unless `--no-auth` is given.
+Supported files: `.mp4`, `.m4v`, `.mov`, `.webm`, `.mkv`. Subtitle files: `.srt`, `.ass`, `.ssa`, `.vtt`.
 
-Supported files: `.mp4`, `.m4v`, `.mov`, `.webm` (played as-is) and `.mkv` (asks before converting on first play).
+A systemd user service is in `deploy/` (see the comments in it).
 
-## Running as a systemd service
+## Bandwidth
 
-Install the binary and set up a user service, which runs as you so it can read your videos:
-
-```sh
-cargo install --path .
-
-# Password file, readable only by you
-echo 'W2G_PASSWORD=choose-a-password' > ~/.config/watch2gether.env
-chmod 600 ~/.config/watch2gether.env
-
-mkdir -p ~/.config/systemd/user
-cp deploy/watch2gether.service ~/.config/systemd/user/
-# Edit the folder and port in ExecStart if needed, then:
-systemctl --user daemon-reload
-systemctl --user enable --now watch2gether
-
-# Keep it running when you're logged out
-loginctl enable-linger "$USER"
-```
-
-Logs: `journalctl --user -u watch2gether -f`
+Copied video streams at its original bitrate (file size ÷ duration: a 2 GB, 2.5-hour movie is about 1.8 Mbit/s). Transcoded video gets about 1.5× the source bitrate, capped at 5 Mbit/s. Each viewer's connection needs to keep up with that. If it can't, strict sync makes the room wait rather than letting the slow viewer fall behind. The player keeps up to a minute of video buffered ahead. hls.js is compiled into the binary, so nothing loads from a CDN (some are blocked in China).
 
 ## How sync works
 
 The server holds the single source of truth for the room: which video, playing or paused, and the position. Browsers talk to it over a WebSocket.
 
 - Every action (play, pause, seek, picking a video) goes to the server, which broadcasts the new state to everyone.
-- While playing, the server re-broadcasts its position every 2 seconds, and any viewer more than 0.6s off is corrected.
+- While playing, the server re-broadcasts its position every 2 seconds, and any viewer more than 0.6 s off is corrected.
 - Every viewer tells the server whether they're **ready**, meaning they have enough video buffered at the current position. The room plays only while everyone is ready:
-  - when someone stalls for more than 0.7s, everyone pauses;
+  - when someone stalls for more than 0.7 s, everyone pauses;
   - after any seek or new video, everyone must confirm they've loaded the new spot before playback resumes;
   - a viewer who joins or reconnects counts as not ready until they've loaded.
 - The room resumes from the slowest viewer's position, so a viewer on a weak connection never has to jump forward into video they haven't downloaded.
-- On a viewer who keeps stalling, the buffer required before resuming doubles (3s, 6s, ... up to 30s), so the room pauses less often but for longer.
-- A **Resume anyway** button lets anyone stop waiting for a stalled viewer.
+- **Resume anyway** lets anyone stop waiting for a stalled viewer.
+- If a viewer's browser cannot play the video at all, everyone sees why instead of waiting forever.
 
 ## Limitations
 
-- **Bandwidth.** Video is streamed at its original quality. A viewer needs a connection faster than the file's bitrate (roughly file size ÷ duration), otherwise the room will spend a lot of time waiting for them. 4K remuxes can be 15+ Mbit/s.
-- **`.mkv` conversion** keeps only the first audio track and drops subtitles. The first play of a large file takes a while (it's a one-time copy). The cache is never cleaned automatically, and each converted file takes about as much space as the original.
-- **Codecs.** Conversion changes the container, not the video codec. Very heavy files, such as 4K 10-bit HDR HEVC, may still be too much for some phones.
-- **iPhone fullscreen** uses Safari's native player, which can't show anything the page draws on top.
-- **One room per server.** Everyone connected shares the same room.
+- **HDR** HEVC is transcoded without tone-mapping, so it looks washed out. Use SDR releases where you can.
+- **Image subtitles** (PGS, VobSub) can't be shown; the subtitle menu lists them as skipped. ASS styling and positioning are reduced to plain text with line breaks and italics.
+- **The first play** of a file that needs preparing waits for the whole preparation. Copying is quick; a software transcode of a long HEVC film can take a long time, so start it ahead of time (pick the video, then end the session).
+- **One room per server.** Everyone with access shares the same room.
+- **iPhone** has no element fullscreen; the fullscreen button hides the side panels instead.
+- Subtitle links must point to the subtitle file itself (no zip/rar archives).
 
 ## Project layout
 
 ```
-src/main.rs        server: CLI, auth, WebSocket sync, room state, file library
-src/convert.rs     on-demand mkv → mp4 conversion with ffmpeg
+src/main.rs        server: CLI, roles and share links, WebSocket sync, media routes, library, tests
+src/convert.rs     probing, direct-play rule, HLS preparation with ffmpeg
+src/subs.rs        sidecar discovery, encoding detection, WebVTT conversion, safe URL download
+src/store.rs       state.json: links, sessions, added subtitles, delays
 static/index.html  the player page (compiled into the binary)
-static/login.html  the login page
+static/login.html  the host login page
+static/hls.min.js  hls.js 1.7.3 (Apache-2.0, see static/LICENSE-hls.js.txt)
+Dockerfile         build + Debian runtime with ffmpeg and Intel's VAAPI driver
+.github/workflows  tests, then image build and push to GHCR
 deploy/            systemd user service
 ```
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Original work © stasnocap; hls.js is Apache-2.0.

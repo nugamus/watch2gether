@@ -3,7 +3,7 @@ name = "watch2gether"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/stasnocap/watch2gether"
+repository = "https://github.com/nugamus/watch2gether"
 description = "Watch local videos together over the internet, in strict sync"
 
 [dependencies]
