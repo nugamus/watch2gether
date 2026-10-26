@@ -366,9 +366,6 @@ enum In {
     Failed {
         msg: String,
     },
-    Hello {
-        name: String,
-    },
     Chat {
         text: String,
     },
@@ -657,10 +654,12 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
     let mut rx = app.tx.subscribe();
     let (mut sink, mut stream) = socket.split();
 
+    let name = viewer_name(&app, &role);
     // A newcomer counts as not ready until they confirm, so a playing room pauses for them.
     let (first, chat) = {
         let mut r = app.room.lock().unwrap();
         r.clients.insert(id);
+        r.names.insert(id, name);
         if r.current.is_some() {
             r.buffering(id);
         }
@@ -740,6 +739,24 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
         let _ = app.tx.send(snap);
     }
     broadcast_viewers(&app);
+}
+
+/// What everyone sees a viewer as: the name the host gave their share link, or "Host".
+/// Nobody has to type a name.
+fn viewer_name(app: &App, role: &Role) -> String {
+    let Role::Guest { sid } = role else {
+        return "Host".into();
+    };
+    let link = app.store.guest(sid);
+    let name = app.store.read(|d| {
+        d.links
+            .iter()
+            .find(|l| Some(&l.id) == link.as_ref())
+            .map(|l| l.name.clone())
+    });
+    name.filter(|n| !n.trim().is_empty())
+        .map(|n| n.trim().chars().take(24).collect())
+        .unwrap_or_else(|| "Guest".into())
 }
 
 /// Apply one WebSocket command from viewer `id`. Host-only commands from guests are ignored.
@@ -858,20 +875,6 @@ async fn handle(app: &Shared, id: u64, role: &Role, cmd: In) {
             }
             r.reacted.insert(id, Instant::now());
             serde_json::to_string(&Out::React { name, r: reaction }).unwrap()
-        }
-        In::Hello { name } => {
-            let name: String = name
-                .trim()
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(24)
-                .collect();
-            let mut r = app.room.lock().unwrap();
-            if name.is_empty() {
-                return;
-            }
-            r.names.insert(id, name);
-            r.snapshot(0)
         }
         cmd => {
             let mut r = app.room.lock().unwrap();
@@ -2085,6 +2088,15 @@ mod tests {
         );
         // a.mp4 / b.mp4 are not real videos: they fail once and are not retried every round.
         assert_eq!(failed.len(), 2);
+    }
+
+    #[test]
+    fn viewers_are_named_after_their_link() {
+        let t = setup();
+        let (_, token) = t.app.store.create_link("Lin".into(), None);
+        let sid = t.app.store.redeem(&token).unwrap();
+        assert_eq!(viewer_name(&t.app, &Role::Guest { sid }), "Lin");
+        assert_eq!(viewer_name(&t.app, &Role::Host), "Host");
     }
 
     #[tokio::test]
