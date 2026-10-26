@@ -21,7 +21,7 @@ encoding_rs = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.53.2", features = ["full"] }
-tower-http = { version = "0.7.1", features = ["fs"] }
+tower-http = { version = "0.7.1", features = ["fs", "compression-gzip"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
-use tower_http::services::ServeFile;
+use tower_http::{compression::CompressionLayer, services::ServeFile};
 
 mod convert;
 mod store;
@@ -568,6 +568,20 @@ fn router(app: Shared) -> Router {
         .route("/login", get(login_page).post(login_post))
         .route("/r/{token}", get(redeem))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
+        // Gzip the page, hls.js (620 KB -> ~190 KB) and subtitles for slow links. Video is already
+        // compressed, and partial (range) responses must not be.
+        .layer(CompressionLayer::new().compress_when(
+            |status: StatusCode,
+             _: axum::http::Version,
+             h: &HeaderMap,
+             _: &axum::http::Extensions| {
+                let ct = h
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                status == StatusCode::OK && (ct.starts_with("text/") || ct.contains("javascript"))
+            },
+        ))
         .with_state(app)
 }
 
@@ -1695,6 +1709,53 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn page_and_hls_js_are_gzipped_video_is_not() {
+        let t = setup();
+        let host = host_cookie(&t.app);
+        let req = |path: &str| {
+            HttpRequest::get(path)
+                .header(header::COOKIE, &host)
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap()
+        };
+        for path in ["/hls.js", "/"] {
+            let res = router(t.app.clone()).oneshot(req(path)).await.unwrap();
+            assert_eq!(
+                res.headers()
+                    .get(header::CONTENT_ENCODING)
+                    .map(|v| v.to_str().unwrap()),
+                Some("gzip"),
+                "{path}"
+            );
+        }
+        let root = t.app.root.clone();
+        t.app
+            .activate(
+                "a.mp4".into(),
+                Media::Direct(root.join("a.mp4")),
+                Default::default(),
+                0,
+            )
+            .await;
+        let nonce = t
+            .app
+            .room
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .nonce
+            .clone();
+        let res = router(t.app.clone())
+            .oneshot(req(&format!("/m/{nonce}/video")))
+            .await
+            .unwrap();
+        assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
     }
 
     #[tokio::test]
