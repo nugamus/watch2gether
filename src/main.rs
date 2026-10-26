@@ -351,7 +351,11 @@ enum In {
     Seek {
         t: f64,
     },
-    Buffering,
+    Buffering {
+        /// Why the viewer thinks it is not ready, for the log.
+        #[serde(default)]
+        why: String,
+    },
     Ready {
         t: f64,
         seq: u64,
@@ -437,6 +441,7 @@ enum Out {
     },
     Welcome {
         host: bool,
+        build: &'static str,
         /// Recent chat, so a (re)joining viewer sees the conversation.
         chat: Vec<ChatMsg>,
     },
@@ -473,6 +478,12 @@ struct App {
 
 type Shared = Arc<App>;
 
+/// Which build this is (set by CI: run number, commit, date), so it is clear what is deployed.
+const BUILD: &str = match option_env!("W2G_BUILD") {
+    Some(b) => b,
+    None => "dev",
+};
+
 fn default_dir(env: &str, home_sub: &str) -> PathBuf {
     std::env::var_os(env)
         .map(PathBuf::from)
@@ -484,6 +495,7 @@ fn default_dir(env: &str, home_sub: &str) -> PathBuf {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    println!("watch2gether build {BUILD}");
     let root = match args.dir.canonicalize() {
         Ok(p) if p.is_dir() => p,
         _ => {
@@ -656,6 +668,7 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
     };
     let welcome = serde_json::to_string(&Out::Welcome {
         host: role == Role::Host,
+        build: BUILD,
         chat,
     })
     .unwrap();
@@ -865,8 +878,26 @@ async fn handle(app: &Shared, id: u64, role: &Role, cmd: In) {
             if r.current.is_none() {
                 return;
             }
+            // One line per sync event: when the room keeps waiting, the log says who and why.
+            let who = r
+                .names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("viewer {id}"));
+            match &cmd {
+                In::Buffering { why } => {
+                    let why: String = why.chars().filter(|c| !c.is_control()).take(120).collect();
+                    println!("{who}: not ready ({why})")
+                }
+                In::Ready { t, .. } => println!("{who}: ready at {t:.1}"),
+                In::Play { t } => println!("{who}: play at {t:.1}"),
+                In::Pause { t } => println!("{who}: pause at {t:.1}"),
+                In::Seek { t } => println!("{who}: seek to {t:.1}"),
+                In::Force => println!("{who}: resume anyway"),
+                _ => {}
+            }
             match cmd {
-                In::Buffering => r.buffering(id),
+                In::Buffering { .. } => r.buffering(id),
                 In::Ready { t, seq } => r.ready(id, t, seq),
                 In::Force => {
                     r.buffering.clear();

@@ -4,6 +4,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
 COPY static static
+# Shown in the log and the host's library panel; CI passes "<run> <commit> <date>".
+ARG W2G_BUILD=dev
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked && cp target/release/watch2gether /usr/local/bin/

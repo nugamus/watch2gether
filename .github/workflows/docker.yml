@@ -35,12 +35,15 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - id: ver
+        run: echo "v=${{ github.run_number }} $(git rev-parse --short HEAD) $(date -u +%F)" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/watch2gether
           tags: |
             type=raw,value=latest
+            type=raw,value=build-${{ github.run_number }}
             type=sha
       - uses: docker/build-push-action@v6
         with:
@@ -49,5 +52,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: W2G_BUILD=${{ steps.ver.outputs.v }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
