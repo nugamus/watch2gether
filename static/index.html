@@ -7,7 +7,6 @@
   #main{flex:1;min-height:0;display:flex}
   #lib{flex:0 0 280px;width:280px;overflow-y:auto;overflow-x:hidden;border-right:1px solid #222;padding:6px;box-sizing:border-box}
   #lib .file{padding:4px 8px;cursor:pointer;border-radius:4px;word-break:break-all}
-  #lib .del{float:right;margin-left:6px;opacity:.5}#lib .del:hover{opacity:1}
   #lib .file:hover{background:#1c1c24}#lib .file.cur{background:#2a2a40}
   #lib summary{padding:4px 6px;cursor:pointer;user-select:none;color:#aab}
   #lib .kids{margin-left:14px;border-left:1px solid #222;padding-left:4px}
@@ -30,8 +29,9 @@
   #status.ok{color:#6c6}#status.bad{color:#e66}
 </style></head>
 <body>
-<div id="main"><div id="lib"></div><div id="stage"><video id="v" controls playsinline preload="auto"></video><button id="tap" type="button" hidden>▶ Tap to join playback</button><div id="wait" hidden><span id="waitText"></span> <button id="force" type="button">Resume anyway</button></div><div id="prep" hidden><div id="prepText"></div><div class="bar"><i id="prepBar"></i></div><small>Converting for browser playback (first time only)</small></div></div></div>
+<div id="main"><div id="lib"></div><div id="stage"><video id="v" controls playsinline preload="auto"></video><button id="tap" type="button" hidden>▶ Tap to join playback</button><div id="wait" hidden><span id="waitText"></span> <button id="force" type="button">Resume anyway</button></div><div id="prep" hidden><div id="prepText"></div><div class="bar"><i id="prepBar"></i></div><small>Preparing for browser playback (first time only)</small></div></div></div>
 <div id="bar"><span id="status" class="bad">connecting…</span><button id="toggle" type="button">☰ Library</button><span id="viewers"></span></div>
+<script src="/hls.js"></script>
 <script>
 const v = document.getElementById('v');
 const tap = document.getElementById('tap');
@@ -57,7 +57,7 @@ function setHidden(h) {
 document.getElementById('toggle').onclick = () => setHidden(!main.classList.contains('hide'));
 try { setHidden(localStorage.getItem('w2g-hide') === '1'); } catch { setHidden(false); }
 
-let files = [], canDelete = false;
+let files = [];
 async function loadLib() {
   files = await (await fetch('/api/files')).json();
   renderLib();
@@ -86,16 +86,7 @@ function renderLib() {
       const d = document.createElement('div');
       d.textContent = name; d.title = f; d.dataset.f = f;
       d.className = 'file' + (f === curFile ? ' cur' : '');
-      d.onclick = () => { pendingSel = f; send({type:'select', path:f}); if (mobile.matches) setHidden(true); };
-      if (canDelete) {
-        const x = document.createElement('span');
-        x.className = 'del'; x.textContent = '🗑'; x.title = 'Delete from disk';
-        x.onclick = e => {
-          e.stopPropagation();
-          if (confirm('Permanently delete ' + f + ' from the server\'s disk? This cannot be undone.')) send({type:'delete', path:f});
-        };
-        d.appendChild(x);
-      }
+      d.onclick = () => { send({type:'select', path:f}); if (mobile.matches) setHidden(true); };
       parent.appendChild(d);
     }
   };
@@ -104,7 +95,6 @@ function renderLib() {
   if (!files.length) lib.textContent = 'No videos found';
 }
 const expected = () => last.playing ? last.t + (performance.now()-last.at)/1000 : last.t;
-let pendingSel = null;
 const send = o => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
 
 function connect() {
@@ -116,25 +106,33 @@ function connect() {
     if (m.type === 'viewers') document.getElementById('viewers').textContent = m.n + ' watching';
     if (m.type === 'state') apply(m);
     if (m.type === 'progress') { document.getElementById('prepBar').style.width = m.pct + '%'; document.getElementById('prepText').textContent = 'Preparing ' + base(m.path) + '… ' + m.pct + '%'; }
-    if (m.type === 'confirm' && m.path === pendingSel) {
-      pendingSel = null;
-      if (confirm(base(m.path) + ' must be converted to MP4 before it can play in the browser. This can take a while.' + (m.delete_source ? ' The original .mkv will be DELETED after the MP4 is checked.' : ' It uses disk space.') + ' Convert now?')) send({type:'select', path:m.path, convert:true});
-    }
-    if (m.type === 'config') { canDelete = m.can_delete; renderLib(); }
-    if (m.type === 'deleted') { files = files.filter(f => f !== m.path); renderLib(); }
     if (m.type === 'error') flash(m.msg);
   };
 }
 
+// HLS: hls.js where it works (Firefox, Chrome); Safari's own player where Safari can switch audio
+// tracks itself (iPad, Mac) or hls.js can't run (older iPhones).
+let hls = null;
+const nativeHls = () => v.canPlayType('application/vnd.apple.mpegurl') && (v.audioTracks || !window.Hls?.isSupported());
+function load(src) {
+  if (hls) { hls.destroy(); hls = null; }
+  if (!src) { v.removeAttribute('src'); v.load(); return; }
+  if (src.endsWith('.m3u8') && !nativeHls()) {
+    hls = new Hls({maxBufferLength: 60, maxMaxBufferLength: 180});
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) send({type:'failed', msg: d.details}); });
+    hls.loadSource(src); hls.attachMedia(v);
+  } else v.src = src;
+}
+v.addEventListener('error', () => { if (curSrc && v.error) send({type:'failed', msg: 'decode error ' + v.error.code + ' ' + (v.error.message || '')}); });
 function apply(m) {
   prep.hidden = !m.preparing;
   if (m.preparing) { document.getElementById('prepText').textContent = 'Preparing ' + base(m.preparing) + '…'; }
   else document.getElementById('prepBar').style.width = '0';
-  const src = m.cached ? '/cache/' + m.cached + '.mp4' : (m.file ? url(m.file) : null);
+  const src = m.cached ? '/cache/' + m.cached + '/master.m3u8' : (m.file ? url(m.file) : null);
   const w = document.getElementById('wait');
   w.hidden = !m.waiting;
   if (m.waiting) waitText.textContent = '⏳ Waiting for ' + m.waiting + (m.waiting > 1 ? ' viewers' : ' viewer') + ' to buffer…';
-  if (src !== curSrc) { curSrc = src; resetBuffering(); if (src) v.src = src; else v.removeAttribute('src'); }
+  if (src !== curSrc) { curSrc = src; resetBuffering(); load(src); }
   if (m.file !== curFile) {
     curFile = m.file;
     for (const d of lib.querySelectorAll('.file')) d.classList.toggle('cur', d.dataset.f === curFile);

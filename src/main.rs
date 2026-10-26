@@ -24,6 +24,7 @@ use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 mod convert;
+mod subs;
 
 #[derive(Parser)]
 #[command(about = "Watch a local video together, in sync")]
@@ -41,12 +42,6 @@ struct Args {
     /// Where converted (mkv -> mp4) copies are kept [default: ~/.cache/watch2gether]
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-    /// After converting an mkv, keep the MP4 next to it in the library and delete the original mkv
-    #[arg(long)]
-    delete_source: bool,
-    /// Let viewers delete video files from disk via the library (asks for confirmation first)
-    #[arg(long)]
-    allow_delete: bool,
     /// Allow anyone who can reach the port to join
     #[arg(long, conflicts_with = "password")]
     no_auth: bool,
@@ -68,7 +63,10 @@ impl Auth {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        Auth { password_digest: digest(password), token }
+        Auth {
+            password_digest: digest(password),
+            token,
+        }
     }
 }
 
@@ -175,19 +173,27 @@ impl Room {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum In {
-    Play { t: f64 },
-    Pause { t: f64 },
-    Seek { t: f64 },
-    /// `convert` is set once the user has agreed to converting a file that needs it.
+    Play {
+        t: f64,
+    },
+    Pause {
+        t: f64,
+    },
+    Seek {
+        t: f64,
+    },
     Select {
         path: String,
-        #[serde(default)]
-        convert: bool,
     },
-    /// Permanently delete a library file (only with `--allow-delete`).
-    Delete { path: String },
+    /// This viewer's browser cannot play the video; tell everyone why the room is stuck.
+    Failed {
+        msg: String,
+    },
     Buffering,
-    Ready { t: f64, seq: u64 },
+    Ready {
+        t: f64,
+        seq: u64,
+    },
     /// Escape hatch: stop waiting for whoever is stalled.
     Force,
 }
@@ -205,13 +211,16 @@ enum Out {
         seq: u64,
         origin: u64,
     },
-    Progress { path: String, pct: u8 },
-    /// `path` needs converting first; whoever picked it is asked before anything starts.
-    Confirm { path: String, delete_source: bool },
-    Error { msg: String },
-    Config { can_delete: bool },
-    Deleted { path: String },
-    Viewers { n: usize },
+    Progress {
+        path: String,
+        pct: u8,
+    },
+    Error {
+        msg: String,
+    },
+    Viewers {
+        n: usize,
+    },
 }
 
 struct App {
@@ -220,8 +229,7 @@ struct App {
     login_lock: tokio::sync::Mutex<()>,
     root: PathBuf,
     cache: PathBuf,
-    delete_source: bool,
-    allow_delete: bool,
+    encoder: convert::Encoder,
     /// Cache keys with a conversion in flight.
     jobs: Mutex<HashSet<String>>,
     room: Mutex<Room>,
@@ -246,7 +254,9 @@ async fn main() {
         (Some(p), _) if !p.is_empty() => Some(Auth::new(p)),
         (_, true) => None,
         _ => {
-            eprintln!("set a password (W2G_PASSWORD or --password), or pass --no-auth to disable the check");
+            eprintln!(
+                "set a password (W2G_PASSWORD or --password), or pass --no-auth to disable the check"
+            );
             std::process::exit(1);
         }
     };
@@ -262,14 +272,15 @@ async fn main() {
         std::process::exit(1);
     }
     convert::clean_partials(&cache);
+    let encoder = convert::detect_encoder().await;
+    println!("video encoder for transcodes: {encoder:?}");
     let (tx, _) = broadcast::channel(64);
     let app = Arc::new(App {
         auth,
         login_lock: tokio::sync::Mutex::new(()),
         root: root.clone(),
         cache: cache.clone(),
-        delete_source: args.delete_source,
-        allow_delete: args.allow_delete,
+        encoder,
         jobs: Mutex::new(HashSet::new()),
         room: Mutex::new(Room {
             file: None,
@@ -305,8 +316,23 @@ async fn main() {
     });
 
     let router = Router::new()
-        .route("/", get(|| async { Html(include_str!("../static/index.html")) }))
+        .route(
+            "/",
+            get(|| async { Html(include_str!("../static/index.html")) }),
+        )
         .route("/ws", get(ws_handler))
+        .route(
+            "/hls.js",
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/javascript"),
+                        (header::CACHE_CONTROL, "max-age=86400"),
+                    ],
+                    include_str!("../static/hls.min.js"),
+                )
+            }),
+        )
         .route("/api/files", get(list_files))
         .nest_service("/video", ServeDir::new(&root))
         .nest_service("/cache", ServeDir::new(&cache))
@@ -316,7 +342,11 @@ async fn main() {
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-    println!("Sharing {} on http://{addr} (conversion cache: {})", root.display(), cache.display());
+    println!(
+        "Sharing {} on http://{addr} (conversion cache: {})",
+        root.display(),
+        cache.display()
+    );
     axum::serve(listener, router).await.unwrap();
 }
 
@@ -326,7 +356,9 @@ async fn ws_handler(ws: WebSocketUpgrade, State(app): State<Shared>) -> impl Int
 
 fn broadcast_viewers(app: &App) {
     let n = *app.viewers.lock().unwrap();
-    let _ = app.tx.send(serde_json::to_string(&Out::Viewers { n }).unwrap());
+    let _ = app
+        .tx
+        .send(serde_json::to_string(&Out::Viewers { n }).unwrap());
 }
 
 async fn client(socket: WebSocket, app: Shared) {
@@ -346,8 +378,6 @@ async fn client(socket: WebSocket, app: Shared) {
         r.buffering(id);
         r.snapshot(0)
     };
-    let config = serde_json::to_string(&Out::Config { can_delete: app.allow_delete }).unwrap();
-    let _ = sink.send(Message::text(config)).await;
     let _ = sink.send(Message::text(first.clone())).await;
     let _ = app.tx.send(first);
     broadcast_viewers(&app);
@@ -364,21 +394,25 @@ async fn client(socket: WebSocket, app: Shared) {
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
             let Message::Text(text) = msg else { continue };
-            let Ok(cmd) = serde_json::from_str::<In>(&text) else { continue };
-            if let In::Select { path, convert } = cmd {
+            let Ok(cmd) = serde_json::from_str::<In>(&text) else {
+                continue;
+            };
+            if let In::Select { path } = cmd {
                 if is_video(&app2.root, &path) {
-                    select(&app2, path, id, convert).await;
+                    select(&app2, path, id).await;
                 }
                 continue;
             }
-            if let In::Delete { path } = cmd {
-                delete(&app2, path);
+            if let In::Failed { msg } = cmd {
+                app2.send(&Out::Error {
+                    msg: format!("A viewer cannot play this video: {msg}"),
+                });
                 continue;
             }
             let out = {
                 let mut r = app2.room.lock().unwrap();
                 match cmd {
-                    In::Select { .. } | In::Delete { .. } => unreachable!(),
+                    In::Select { .. } | In::Failed { .. } => unreachable!(),
                     In::Buffering => r.buffering(id),
                     In::Ready { t, seq } => r.ready(id, t, seq),
                     In::Force => {
@@ -448,70 +482,30 @@ impl App {
     }
 }
 
-/// Remove a library file from disk and drop it from the room if it was playing.
-fn delete(app: &Shared, path: String) {
-    if !app.allow_delete {
-        app.send(&Out::Error { msg: "Deleting files is disabled (start with --allow-delete)".into() });
-        return;
-    }
-    if !is_video(&app.root, &path) {
-        return;
-    }
-    if let Err(e) = std::fs::remove_file(app.root.join(&path)) {
-        app.send(&Out::Error { msg: format!("Could not delete {path}: {e}") });
-        return;
-    }
-    eprintln!("deleted {path}");
-    let snap = {
-        let mut r = app.room.lock().unwrap();
-        let current = r.file.as_deref() == Some(path.as_str())
-            || r.preparing.as_deref() == Some(path.as_str());
-        current.then(|| {
-            r.file = None;
-            r.cached = None;
-            r.preparing = None;
-            r.seq += 1;
-            r.clear_hold();
-            r.set(false, 0.0);
-            r.snapshot(0)
-        })
+async fn select(app: &Shared, path: String, id: u64) {
+    let src = app.root.join(&path);
+    let info = match convert::probe(&src).await {
+        Ok(i) => i,
+        Err(e) => {
+            return app.send(&Out::Error {
+                msg: format!("Cannot play {path}: {e}"),
+            });
+        }
     };
-    app.send(&Out::Deleted { path });
-    if let Some(snap) = snap {
-        let _ = app.tx.send(snap);
-    }
-}
-
-async fn select(app: &Shared, path: String, id: u64, confirmed: bool) {
-    if !convert::needs_conversion(&path) {
+    if convert::direct_play(&path, &info) {
         app.switch_to(path, None, id);
         return;
     }
-    let src = app.root.join(&path);
-    let Some(key) = convert::cache_key(&src, &path) else { return };
-    // With delete_source the MP4 is written next to the original (which it then replaces);
-    // otherwise it goes to the cache.
-    let sibling = app
-        .delete_source
-        .then(|| std::path::Path::new(&path).with_extension("mp4").to_string_lossy().into_owned());
-    let out = match &sibling {
-        Some(rel) => app.root.join(rel),
-        None => convert::cache_file(&app.cache, &key),
-    };
-    if out.exists() {
-        match sibling {
-            Some(rel) => app.switch_to(rel, None, id),
-            None => app.switch_to(path, Some(key), id),
-        }
+    let Some(key) = convert::cache_key(&src, &path) else {
         return;
-    }
-    // Never start a conversion unasked; the picker is prompted and re-sends with `convert`.
-    if !confirmed && !app.jobs.lock().unwrap().contains(&key) {
-        app.send(&Out::Confirm { path, delete_source: app.delete_source });
+    };
+    let dir = app.cache.join(&key);
+    if convert::load_meta(&dir).is_some() {
+        app.switch_to(path, Some(key), id);
         return;
     }
 
-    // Pause everyone and show "preparing" while ffmpeg remuxes in the background.
+    // Pause everyone and show progress while ffmpeg works in the background.
     let msg = {
         let mut r = app.room.lock().unwrap();
         r.preparing = Some(path.clone());
@@ -525,36 +519,19 @@ async fn select(app: &Shared, path: String, id: u64, confirmed: bool) {
     }
     let app = app.clone();
     tokio::spawn(async move {
-        let p2 = path.clone();
-        let a2 = app.clone();
-        let res = convert::run(&src, &out, move |pct| {
-            a2.send(&Out::Progress { path: p2.clone(), pct })
+        let (p2, a2) = (path.clone(), app.clone());
+        let res = convert::run(&src, &dir, app.encoder, move |pct| {
+            a2.send(&Out::Progress {
+                path: p2.clone(),
+                pct,
+            })
         })
         .await;
-        // Only delete the original once the converted copy has been checked.
-        let res = match res {
-            Ok(()) if sibling.is_some() => match convert::verify(&src, &out).await {
-                Ok(()) => {
-                    if let Err(e) = std::fs::remove_file(&src) {
-                        eprintln!("converted {path} but could not delete the original: {e}");
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&out);
-                    Err(format!("converted copy failed verification, original kept ({e})"))
-                }
-            },
-            other => other,
-        };
         app.jobs.lock().unwrap().remove(&key);
         let still_wanted = app.room.lock().unwrap().preparing.as_deref() == Some(path.as_str());
         match res {
-            Ok(()) if still_wanted => match sibling {
-                Some(rel) => app.switch_to(rel, None, 0),
-                None => app.switch_to(path, Some(key), 0),
-            },
-            Ok(()) => {}
+            Ok(_) if still_wanted => app.switch_to(path, Some(key), 0),
+            Ok(_) => {}
             Err(msg) => {
                 eprintln!("conversion of {path} failed: {msg}");
                 if still_wanted {
@@ -565,7 +542,9 @@ async fn select(app: &Shared, path: String, id: u64, confirmed: bool) {
                     };
                     let _ = app.tx.send(snap);
                 }
-                app.send(&Out::Error { msg: format!("Could not convert {path}: {msg}") });
+                app.send(&Out::Error {
+                    msg: format!("Could not convert {path}: {msg}"),
+                });
             }
         }
     });
@@ -587,16 +566,19 @@ fn is_video(root: &std::path::Path, rel: &str) -> bool {
 }
 
 fn scan(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
             scan(root, &p, out);
-        } else if ft.is_file() && has_video_ext(&p) {
-            if let Ok(rel) = p.strip_prefix(root) {
-                out.push(rel.to_string_lossy().into_owned());
-            }
+        } else if ft.is_file()
+            && has_video_ext(&p)
+            && let Ok(rel) = p.strip_prefix(root)
+        {
+            out.push(rel.to_string_lossy().into_owned());
         }
     }
 }
@@ -624,7 +606,9 @@ fn has_session(req: &Request, token: &str) -> bool {
 }
 
 async fn guard(State(app): State<Shared>, req: Request, next: Next) -> Response {
-    let Some(auth) = &app.auth else { return next.run(req).await };
+    let Some(auth) = &app.auth else {
+        return next.run(req).await;
+    };
     let path = req.uri().path();
     if path == "/login" || has_session(&req, &auth.token) {
         return next.run(req).await;
@@ -646,7 +630,9 @@ struct LoginForm {
 }
 
 async fn login_post(State(app): State<Shared>, Form(f): Form<LoginForm>) -> Response {
-    let Some(auth) = &app.auth else { return Redirect::to("/").into_response() };
+    let Some(auth) = &app.auth else {
+        return Redirect::to("/").into_response();
+    };
     let _guard = app.login_lock.lock().await;
     if digest(&f.password) == auth.password_digest {
         let cookie = format!(
