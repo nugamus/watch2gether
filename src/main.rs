@@ -471,6 +471,9 @@ struct App {
     room: Mutex<Room>,
     tx: broadcast::Sender<String>,
     next_id: Mutex<u64>,
+    /// The host's current connection. Only one host window drives the room: opening another
+    /// closes the older one, so two windows never fight over play, pause and seeks.
+    host_conn: tokio::sync::watch::Sender<u64>,
 }
 
 type Shared = Arc<App>;
@@ -581,6 +584,7 @@ fn new_app(
         room: Mutex::new(Room::new()),
         tx,
         next_id: Mutex::new(1),
+        host_conn: tokio::sync::watch::Sender::new(0),
     })
 }
 
@@ -676,6 +680,12 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
     let _ = app.tx.send(first);
     broadcast_viewers(&app);
 
+    let is_host = role == Role::Host;
+    if is_host {
+        app.host_conn.send_replace(id);
+    }
+    let mut host_conn = app.host_conn.subscribe();
+
     // Pings keep a quiet (paused) connection alive: reverse proxies such as nginx drop a
     // WebSocket after 60 s without traffic.
     let mut send_task = tokio::spawn(async move {
@@ -687,6 +697,15 @@ async fn client(socket: WebSocket, app: Shared, role: Role) {
                     Err(_) => break,
                 },
                 _ = ping.tick() => Message::Ping(Default::default()),
+                Ok(()) = host_conn.changed(), if is_host => {
+                    if *host_conn.borrow_and_update() == id {
+                        continue;
+                    }
+                    // 4001 tells the page not to reconnect (it would take the room back).
+                    let close = axum::extract::ws::CloseFrame { code: 4001, reason: "replaced".into() };
+                    let _ = sink.send(Message::Close(Some(close))).await;
+                    break;
+                }
             };
             if sink.send(out).await.is_err() {
                 break;
